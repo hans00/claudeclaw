@@ -80,6 +80,7 @@ let ws: WebSocket | null = null;
 let running = true;
 let slackDebug = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Dedup: track recently processed message timestamps to avoid handling both message + app_mention
 const recentlyProcessed = new Map<string, number>();
@@ -1459,8 +1460,10 @@ function openSocket(url: string, appToken: string): void {
 
   // Slack Socket Mode connections rotate every ~30 minutes.
   // We reconnect proactively at ~29 minutes to avoid forced disconnects.
+  // Clear any stale timer from a previous socket to prevent it from killing this one.
+  if (proactiveTimer) clearTimeout(proactiveTimer);
   const RECONNECT_MS = 29 * 60 * 1000;
-  setTimeout(() => {
+  proactiveTimer = setTimeout(() => {
     if (!running) return;
     debugLog("Proactive reconnect (30-min rotation)");
     ws?.close(1000, "Proactive reconnect");
