@@ -574,11 +574,18 @@ export async function start(args: string[] = []) {
     }
   }
 
+  function formatForwardText(label: string, result: { exitCode: number; stdout: string; stderr: string }): string {
+    if (result.exitCode === 0) {
+      return `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`;
+    }
+    const details = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+    const prefix = label ? `[${label}] ` : "";
+    return `${prefix}error (exit ${result.exitCode}):\n${details || "Unknown error (no output)"}`;
+  }
+
   function forwardToTelegram(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const text = formatForwardText(label, result);
     for (const userId of currentSettings.telegram.allowedUserIds) {
       telegramSend(userId, text).catch((err) =>
         console.error(`[Telegram] Failed to forward to ${userId}: ${err}`)
@@ -588,9 +595,7 @@ export async function start(args: string[] = []) {
 
   function forwardToDiscord(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const text = formatForwardText(label, result);
     for (const userId of currentSettings.discord.allowedUserIds) {
       discordSendToUser(userId, text).catch((err) =>
         console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
@@ -600,9 +605,7 @@ export async function start(args: string[] = []) {
 
   function forwardToSlack(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!slackSendToUser || currentSettings.slack.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const text = formatForwardText(label, result);
     for (const userId of currentSettings.slack.allowedUserIds) {
       slackSendToUser(userId, text).catch((err) =>
         console.error(`[Slack] Failed to forward to ${userId}: ${err}`)
@@ -612,9 +615,7 @@ export async function start(args: string[] = []) {
 
   function forwardToLine(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!lineSendToUser || currentSettings.line.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const text = formatForwardText(label, result);
     for (const userId of currentSettings.line.allowedUserIds) {
       lineSendToUser(userId, text).catch((err) =>
         console.error(`[LINE] Failed to forward to ${userId}: ${err}`)

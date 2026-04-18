@@ -835,7 +835,8 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
+      const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`, threadId);
     } else {
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
       const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);

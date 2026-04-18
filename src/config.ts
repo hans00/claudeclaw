@@ -57,7 +57,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToTelegram: true,
   },
   telegram: { token: "", allowedUserIds: [] },
-  discord: { token: "", allowedUserIds: [], listenChannels: [] },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], allowedBotIds: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   line: {
     channelAccessToken: "",
@@ -77,6 +77,7 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  sessionTimeoutMs: 0,
 };
 
 export interface HeartbeatExcludeWindow {
@@ -102,6 +103,7 @@ export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
+  allowedBotIds: string[]; // Bot IDs allowed to trigger (mention only, not listen_channel)
 }
 
 export interface SlackConfig {
@@ -184,6 +186,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  sessionTimeoutMs: number;
 }
 
 export interface AgenticMode {
@@ -326,6 +329,9 @@ function parseSettings(raw: Record<string, any>): Settings {
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
+      allowedBotIds: Array.isArray(raw.discord?.allowedBotIds)
+        ? raw.discord.allowedBotIds.map(String)
+        : [],
     },
     slack: {
       botToken: typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : "",
@@ -391,6 +397,9 @@ function parseSettings(raw: Record<string, any>): Settings {
       baseUrl: typeof raw.stt?.baseUrl === "string" ? raw.stt.baseUrl.trim() : "",
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
     },
+    sessionTimeoutMs: Number.isFinite(raw.sessionTimeoutMs) && raw.sessionTimeoutMs > 0
+      ? Number(raw.sessionTimeoutMs)
+      : 0,
   };
 }
 

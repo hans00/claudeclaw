@@ -269,6 +269,9 @@ function guildTriggerReason(message: DiscordMessage): string | null {
   // Mention in content (fallback)
   if (botUserId && message.content.includes(`<@${botUserId}>`)) return "mention_in_content";
 
+  // Text mention by username (for bots that forget to use proper mentions)
+  if (botUsername && message.content.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return "text_mention";
+
   // Listen channel (respond to all messages, no mention needed)
   const config = getSettings().discord;
   if (config.listenChannels.includes(message.channel_id)) return "listen_channel";
@@ -426,8 +429,12 @@ async function respondToInteraction(
 async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
   const config = getSettings().discord;
 
-  // Ignore bot messages
-  if (message.author.bot) return;
+  // Ignore bot messages, except allowedBotIds (mention only, not listen_channel)
+  if (message.author.bot) {
+    if (!config.allowedBotIds.includes(message.author.id)) return;
+    const reason = guildTriggerReason(message);
+    if (!reason || reason === "listen_channel") return;
+  }
 
   const userId = message.author.id;
   const channelId = message.channel_id;
@@ -464,12 +471,15 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
   // Authorization check
   if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
-    if (isDM) {
+    if (message.author.bot && config.allowedBotIds.includes(userId)) {
+      // allowed bot, skip user auth check
+    } else if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
+      return;
     } else {
       debugLog(`Skip guild message channel=${channelId} from=${userId} reason=unauthorized_user`);
+      return;
     }
-    return;
   }
 
   // Detect attachments
@@ -641,7 +651,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const result = await runUserMessage("discord", prefixedPrompt, threadId);
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
+      const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`);
     } else {
       const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
       if (reactionEmoji) {

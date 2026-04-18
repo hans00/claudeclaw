@@ -562,9 +562,10 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     stopLoadingAnimation(chatId);
 
     if (result.exitCode !== 0) {
+      const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
       await sendText(
         chatId,
-        `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`,
+        `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`,
         event.replyToken,
       );
     } else if (result.stdout) {
