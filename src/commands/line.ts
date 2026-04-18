@@ -1,4 +1,6 @@
-import { ensureProjectClaudeMd, runUserMessage } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, stopCurrentRun } from "../runner";
+import { markSessionInterrupted } from "../sessions";
+import { markThreadInterrupted } from "../sessionManager";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -417,6 +419,29 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
 
+  // Force-stop: handle early, out-of-band
+  if (event.message.type === "text") {
+    const stripped = (event.message.text ?? "")
+      .replace(botDisplayName ? new RegExp(`@${botDisplayName}`, "g") : /(?!)/, "")
+      .trim()
+      .toLowerCase();
+    if (stripped === "/stop") {
+      const stopped = stopCurrentRun(sessionThreadId);
+      if (stopped) {
+        if (sessionThreadId) await markThreadInterrupted(sessionThreadId);
+        else await markSessionInterrupted();
+        await sendText(
+          chatId,
+          "⏹ Stopped. The next message will start fresh and the model will be told the previous task was force-stopped.",
+          event.replyToken,
+        );
+      } else {
+        await sendText(chatId, "No running task to stop.", event.replyToken);
+      }
+      return;
+    }
+  }
+
   // In groups, check requireMention policy (per-group override falls back to global default)
   if (isGroup && event.message.type === "text") {
     const groupOverride = config.groups[chatId]?.requireMention;
@@ -562,6 +587,8 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     stopLoadingAnimation(chatId);
 
     if (result.exitCode !== 0) {
+      // /stop already sent its own acknowledgement — don't double up with an error.
+      if (result.stderr === "Force-stopped by user.") return;
       const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
       await sendText(
         chatId,

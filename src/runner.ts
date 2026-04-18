@@ -1,12 +1,19 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
-import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
+import {
+  getSession,
+  createSession,
+  incrementTurn,
+  markCompactWarned,
+  consumeInterruptedMarker,
+} from "./sessions";
 import {
   getThreadSession,
   createThreadSession,
   incrementThreadTurn,
   markThreadCompactWarned,
+  consumeThreadInterruptedMarker,
 } from "./sessionManager";
 import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
@@ -89,6 +96,51 @@ let globalQueue: Promise<unknown> = Promise.resolve();
 // Per-thread queues — each thread runs independently in parallel
 const threadQueues = new Map<string, Promise<unknown>>();
 
+// --- Active run tracking (for /stop command) ---
+type Cancellable = {
+  kind: "proc" | "abort";
+  kill: () => void;
+};
+const GLOBAL_RUN_KEY = "__global__";
+const activeRuns = new Map<string, Set<Cancellable>>();
+
+function registerActiveRun(threadId: string | undefined, cancellable: Cancellable): () => void {
+  const key = threadId ?? GLOBAL_RUN_KEY;
+  let set = activeRuns.get(key);
+  if (!set) {
+    set = new Set();
+    activeRuns.set(key, set);
+  }
+  set.add(cancellable);
+  return () => {
+    const s = activeRuns.get(key);
+    if (!s) return;
+    s.delete(cancellable);
+    if (s.size === 0) activeRuns.delete(key);
+  };
+}
+
+/**
+ * Force-stop in-flight Claude invocations. When threadId is provided, only
+ * that thread's runs are killed; otherwise the global runs are killed.
+ * Returns true if at least one run was terminated.
+ */
+export function stopCurrentRun(threadId?: string): boolean {
+  const key = threadId ?? GLOBAL_RUN_KEY;
+  const set = activeRuns.get(key);
+  if (!set || set.size === 0) return false;
+  let stopped = false;
+  for (const c of Array.from(set)) {
+    try {
+      c.kill();
+      stopped = true;
+    } catch {}
+  }
+  set.clear();
+  activeRuns.delete(key);
+  return stopped;
+}
+
 function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
   if (threadId) {
     const current = threadQueues.get(threadId) ?? Promise.resolve();
@@ -148,8 +200,9 @@ async function runClaudeOnce(
   model: string,
   api: string,
   baseEnv: Record<string, string>,
-  timeoutMs: number = CLAUDE_TIMEOUT_MS
-): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  threadId?: string
+): Promise<{ rawStdout: string; stderr: string; exitCode: number; stopped: boolean }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
@@ -158,6 +211,15 @@ async function runClaudeOnce(
     stdout: "pipe",
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
+  });
+
+  let forcedStop = false;
+  const unregister = registerActiveRun(threadId, {
+    kind: "proc",
+    kill: () => {
+      forcedStop = true;
+      try { proc.kill("SIGKILL"); } catch {}
+    },
   });
 
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -178,6 +240,7 @@ async function runClaudeOnce(
       rawStdout,
       stderr,
       exitCode: proc.exitCode ?? 1,
+      stopped: forcedStop,
     };
   } catch (err) {
     // Kill the hung process
@@ -190,8 +253,11 @@ async function runClaudeOnce(
     return {
       rawStdout: "",
       stderr: message,
-      exitCode: 124,
+      exitCode: forcedStop ? 137 : 124,
+      stopped: forcedStop,
     };
+  } finally {
+    unregister();
   }
 }
 
@@ -445,7 +511,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, threadId);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -453,8 +519,17 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, threadId);
     usedFallback = true;
+  }
+
+  // User force-stopped this run — surface a recognizable result; skip auto-compact retry.
+  if (exec.stopped) {
+    return {
+      stdout: "",
+      stderr: "Force-stopped by user.",
+      exitCode: exec.exitCode,
+    };
   }
 
   const rawStdout = exec.rawStdout;
@@ -525,7 +600,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, threadId);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
@@ -648,6 +723,11 @@ async function streamClaude(
   const timeoutId = setTimeout(() => abortController.abort(), CLAUDE_TIMEOUT_MS);
   sdkOptions.abortController = abortController;
 
+  const unregister = registerActiveRun(threadId, {
+    kind: "abort",
+    kill: () => { try { abortController.abort(); } catch {} },
+  });
+
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (SDK stream, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 
   let unblocked = false;
@@ -722,6 +802,7 @@ async function streamClaude(
     }
   } finally {
     clearTimeout(timeoutId);
+    unregister();
   }
 
   maybeUnblock();
@@ -736,22 +817,44 @@ export async function streamUserMessage(
   threadId?: string,
   onResult?: (text: string) => void,
 ): Promise<void> {
-  return enqueue(() => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, onResult), threadId);
+  const wrapped = await buildUserPromptPrefix(prompt, threadId);
+  return enqueue(() => streamClaude(name, wrapped, onChunk, onUnblock, threadId, onResult), threadId);
 }
 
-function prefixUserMessageWithClock(prompt: string): string {
+const INTERRUPT_NOTE = [
+  "[system-note]",
+  "The previous task was force-stopped by the user before it could finish.",
+  "Do NOT try to resume, complete, or summarize that prior task. Treat it as abandoned.",
+  "Respond only to the NEW user message below.",
+].join(" ");
+
+async function buildUserPromptPrefix(prompt: string, threadId?: string): Promise<string> {
+  const parts: string[] = [];
+
+  // If the previous run was force-stopped, prepend an interruption note so
+  // Claude doesn't try to pick up where it left off.
+  try {
+    const interrupted = threadId
+      ? await consumeThreadInterruptedMarker(threadId)
+      : await consumeInterruptedMarker();
+    if (interrupted) parts.push(INTERRUPT_NOTE);
+  } catch {}
+
+  // Clock prefix — preserves existing behavior
   try {
     const settings = getSettings();
-    const prefix = buildClockPromptPrefix(new Date(), settings.timezoneOffsetMinutes);
-    return `${prefix}\n${prompt}`;
+    parts.push(buildClockPromptPrefix(new Date(), settings.timezoneOffsetMinutes));
   } catch {
-    const prefix = buildClockPromptPrefix(new Date(), 0);
-    return `${prefix}\n${prompt}`;
+    parts.push(buildClockPromptPrefix(new Date(), 0));
   }
+
+  parts.push(prompt);
+  return parts.join("\n");
 }
 
 export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+  const wrapped = await buildUserPromptPrefix(prompt, threadId);
+  return run(name, wrapped, threadId);
 }
 
 /**

@@ -10,6 +10,7 @@ export interface ThreadSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  interruptedAt?: string;
 }
 
 interface SessionsData {
@@ -107,4 +108,26 @@ export async function listThreadSessions(): Promise<ThreadSession[]> {
 export async function peekThreadSession(threadId: string): Promise<ThreadSession | null> {
   const data = await loadSessions();
   return data.threads[threadId] ?? null;
+}
+
+/**
+ * Mark a thread session as force-stopped. Returns false if no thread session exists.
+ */
+export async function markThreadInterrupted(threadId: string): Promise<boolean> {
+  const data = await loadSessions();
+  const session = data.threads[threadId];
+  if (!session) return false;
+  session.interruptedAt = new Date().toISOString();
+  await saveSessions(data);
+  return true;
+}
+
+/** Read and clear the interrupted marker for a thread session. */
+export async function consumeThreadInterruptedMarker(threadId: string): Promise<boolean> {
+  const data = await loadSessions();
+  const session = data.threads[threadId];
+  if (!session || !session.interruptedAt) return false;
+  delete session.interruptedAt;
+  await saveSessions(data);
+  return true;
 }

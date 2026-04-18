@@ -10,6 +10,7 @@ export interface GlobalSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  interruptedAt?: string;
 }
 
 let current: GlobalSession | null = null;
@@ -75,6 +76,28 @@ export async function markCompactWarned(): Promise<void> {
   if (!existing) return;
   existing.compactWarned = true;
   await saveSession(existing);
+}
+
+/**
+ * Mark the current session as force-stopped so the next user message
+ * can prepend an "interrupted" note to Claude.
+ * No-op if no session exists yet.
+ */
+export async function markSessionInterrupted(): Promise<boolean> {
+  const existing = await loadSession();
+  if (!existing) return false;
+  existing.interruptedAt = new Date().toISOString();
+  await saveSession(existing);
+  return true;
+}
+
+/** Read and clear the interrupted marker. Returns true if it was set. */
+export async function consumeInterruptedMarker(): Promise<boolean> {
+  const existing = await loadSession();
+  if (!existing || !existing.interruptedAt) return false;
+  delete existing.interruptedAt;
+  await saveSession(existing);
+  return true;
 }
 
 export async function resetSession(): Promise<void> {

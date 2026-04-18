@@ -1,7 +1,7 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings } from "../config";
-import { resetSession, peekSession } from "../sessions";
-import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
+import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
+import { listThreadSessions, removeThreadSession, peekThreadSession, markThreadInterrupted } from "../sessionManager";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -380,6 +380,11 @@ async function registerSlashCommands(token: string): Promise<void> {
       type: 1,
     },
     {
+      name: "stop",
+      description: "Force-stop the running task",
+      type: 1,
+    },
+    {
       name: "compact",
       description: "Compact session to reduce context size",
       type: 1,
@@ -494,6 +499,25 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   let cleanContent = content;
   if (botUserId) {
     cleanContent = cleanContent.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
+  }
+
+  // Force-stop the running task. Handled out-of-band (does not enter the queue).
+  const firstToken = cleanContent.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  if (firstToken === "/stop") {
+    const threadIdForStop = knownThreads.has(channelId) ? channelId : undefined;
+    const stopped = stopCurrentRun(threadIdForStop);
+    if (stopped) {
+      if (threadIdForStop) await markThreadInterrupted(threadIdForStop);
+      else await markSessionInterrupted();
+      await sendMessage(
+        config.token,
+        channelId,
+        "⏹ Stopped. The next message will start fresh and the model will be told the previous task was force-stopped.",
+      );
+    } else {
+      await sendMessage(config.token, channelId, "No running task to stop.");
+    }
+    return;
   }
 
   const label = message.author.username;
@@ -651,6 +675,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const result = await runUserMessage("discord", prefixedPrompt, threadId);
 
     if (result.exitCode !== 0) {
+      // /stop already sent its own acknowledgement — don't double up with an error.
+      if (result.stderr === "Force-stopped by user.") return;
       const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`);
     } else {
@@ -696,6 +722,22 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
       await respondToInteraction(interaction, {
         content: "Global session reset. Next message starts fresh.",
       });
+      return;
+    }
+
+    if (interaction.data.name === "stop") {
+      const channelId = interaction.channel_id ?? "";
+      const threadIdForStop = channelId && knownThreads.has(channelId) ? channelId : undefined;
+      const stopped = stopCurrentRun(threadIdForStop);
+      if (stopped) {
+        if (threadIdForStop) await markThreadInterrupted(threadIdForStop);
+        else await markSessionInterrupted();
+        await respondToInteraction(interaction, {
+          content: "⏹ Stopped. The next message will start fresh and the model will be told the previous task was force-stopped.",
+        });
+      } else {
+        await respondToInteraction(interaction, { content: "No running task to stop." });
+      }
       return;
     }
 

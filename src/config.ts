@@ -291,7 +291,7 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
-function parseSettings(raw: Record<string, any>): Settings {
+function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = []): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
     typeof rawLevel === "string" && VALID_LEVELS.has(rawLevel as SecurityLevel)
@@ -323,7 +323,9 @@ function parseSettings(raw: Record<string, any>): Settings {
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
-      allowedUserIds: Array.isArray(raw.discord?.allowedUserIds)
+      allowedUserIds: rawDiscordUserIds.length > 0
+        ? rawDiscordUserIds
+        : Array.isArray(raw.discord?.allowedUserIds)
           ? raw.discord.allowedUserIds.map(String)
           : [],
       listenChannels: Array.isArray(raw.discord?.listenChannels)

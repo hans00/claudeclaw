@@ -1,6 +1,6 @@
-import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings } from "../config";
-import { resetSession, peekSession } from "../sessions";
+import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
@@ -1400,6 +1400,13 @@ async function handleSlashCommand(
     case "/reset": {
       await resetSession();
       return "Session reset. Fresh start!";
+    }
+
+    case "/stop": {
+      const stopped = stopCurrentRun();
+      if (!stopped) return "No running task to stop.";
+      await markSessionInterrupted();
+      return "⏹ Stopped. The next message will start fresh and the model will be told the previous task was force-stopped.";
     }
 
     case "/compact": {

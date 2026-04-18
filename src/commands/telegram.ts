@@ -1,6 +1,6 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings } from "../config";
-import { resetSession, peekSession } from "../sessions";
+import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -624,6 +624,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/stop") {
+    const stopped = stopCurrentRun();
+    if (stopped) {
+      await markSessionInterrupted();
+      await sendMessage(
+        config.token,
+        chatId,
+        "⏹ Stopped. The next message will start fresh and the model will be told the previous task was force-stopped.",
+        threadId,
+      );
+    } else {
+      await sendMessage(config.token, chatId, "No running task to stop.", threadId);
+    }
+    return;
+  }
+
   if (command === "/compact") {
     await sendMessage(config.token, chatId, "⏳ Compacting session...", threadId);
     const result = await compactCurrentSession();
@@ -773,7 +789,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/stop" && command !== "/compact" && command !== "/status" && command !== "/context") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -835,6 +851,8 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
+      // /stop already sent its own acknowledgement — don't double up with an error.
+      if (result.stderr === "Force-stopped by user.") return;
       const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`, threadId);
     } else {
@@ -916,6 +934,7 @@ async function registerBotCommands(token: string): Promise<void> {
     const commands = [
       { command: "start", description: "Show welcome message" },
       { command: "reset", description: "Reset session and start fresh" },
+      { command: "stop", description: "Force-stop the running task" },
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
       { command: "context", description: "Show context window usage" },
@@ -941,7 +960,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "stop", "compact", "status", "context"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
