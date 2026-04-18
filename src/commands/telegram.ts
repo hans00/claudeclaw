@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { readFile } from "node:fs/promises";
@@ -318,6 +318,90 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
         ...(threadId ? { message_thread_id: threadId } : {}),
       });
     }
+  }
+}
+
+// Max bytes we allow in a single streaming-updated message. Telegram's cap is 4096;
+// leave headroom for HTML tag expansion.
+const TELEGRAM_STREAM_MAX_LEN = 3800;
+// Throttle edit calls. Telegram allows ~1 edit/sec per chat; 1.5s is comfortable.
+const TELEGRAM_STREAM_UPDATE_INTERVAL_MS = 1500;
+
+/**
+ * Post a single message (no chunking) and return its message_id.
+ * Falls back to plain text if HTML parsing fails. Used as the streaming anchor.
+ */
+async function postStreamMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+): Promise<number | null> {
+  const clipped = text.length > TELEGRAM_STREAM_MAX_LEN ? text.slice(0, TELEGRAM_STREAM_MAX_LEN) : text;
+  const html = markdownToTelegramHtml(clipped);
+  try {
+    const res = await callApi<{ ok: boolean; result: TelegramMessage }>(token, "sendMessage", {
+      chat_id: chatId,
+      text: html,
+      parse_mode: "HTML",
+      ...(threadId ? { message_thread_id: threadId } : {}),
+    });
+    return res.ok ? res.result.message_id : null;
+  } catch {
+    try {
+      const res = await callApi<{ ok: boolean; result: TelegramMessage }>(token, "sendMessage", {
+        chat_id: chatId,
+        text: clipped,
+        ...(threadId ? { message_thread_id: threadId } : {}),
+      });
+      return res.ok ? res.result.message_id : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Edit a streaming-anchor message in place. Clips to TELEGRAM_STREAM_MAX_LEN,
+ * tries HTML then plain, swallows 'not modified'/'not found' errors.
+ */
+async function editStreamMessage(
+  token: string,
+  chatId: number,
+  messageId: number,
+  text: string,
+): Promise<void> {
+  const clipped = text.length > TELEGRAM_STREAM_MAX_LEN ? text.slice(0, TELEGRAM_STREAM_MAX_LEN) : text;
+  const html = markdownToTelegramHtml(clipped);
+  const attempts: Array<Record<string, unknown>> = [
+    { text: html, parse_mode: "HTML" },
+    { text: clipped },
+  ];
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      await callApi(token, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        ...attempts[i],
+      });
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("message is not modified")) return;
+      if (msg.includes("message to edit not found")) return;
+      if (i === attempts.length - 1) {
+        debugLog(`editStreamMessage failed: ${msg}`);
+        return;
+      }
+    }
+  }
+}
+
+async function deleteStreamMessage(token: string, chatId: number, messageId: number): Promise<void> {
+  try {
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch (err) {
+    debugLog(`deleteStreamMessage failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -848,34 +932,91 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const result = await runUserMessage("telegram", prefixedPrompt);
 
-    if (result.exitCode !== 0) {
-      // /stop already sent its own acknowledgement — don't double up with an error.
-      if (result.stderr === "Force-stopped by user.") return;
-      const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`, threadId);
-    } else {
-      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
-      const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
-      if (reactionEmoji) {
-        await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
-          console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
-        });
+    // Streaming reply: defer the initial post until first chunk, then throttle edits.
+    let streamMsgId: number | null = null;
+    let streamMsgPromise: Promise<number | null> | null = null;
+    let streamText = "";
+    let lastStreamUpdate = 0;
+    let finalResultText: string | null = null;
+    let aborted = false;
+
+    try {
+      await streamUserMessage(
+        "telegram",
+        prefixedPrompt,
+        (text: string) => {
+          streamText = text;
+          const now = Date.now();
+          if (!streamMsgPromise) {
+            streamMsgPromise = postStreamMessage(config.token, chatId, text, threadId);
+            streamMsgPromise.then((id) => { streamMsgId = id; }).catch(() => {});
+            lastStreamUpdate = now;
+          } else if (streamMsgId && now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS) {
+            lastStreamUpdate = now;
+            editStreamMessage(config.token, chatId, streamMsgId, text).catch(() => {});
+          }
+        },
+        () => { /* onUnblock — typing interval already shows progress */ },
+        undefined,
+        (text: string) => { finalResultText = text; },
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      aborted = /abort/i.test(errMsg) || (err instanceof Error && err.name === "AbortError");
+      if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+      if (aborted) {
+        // /stop handler already acked — clean up the placeholder silently.
+        if (streamMsgId) await deleteStreamMessage(config.token, chatId, streamMsgId);
+        return;
       }
-      if (cleanedText) {
-        await sendMessage(config.token, chatId, cleanedText, threadId);
+      if (streamMsgId) {
+        await editStreamMessage(config.token, chatId, streamMsgId, `Error: ${errMsg}`);
+      } else {
+        await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
       }
-      for (const fp of filePaths) {
-        try {
-          await sendDocumentToChat(config.token, chatId, fp, threadId);
-        } catch (err) {
-          console.error(`[Telegram] Failed to send document for ${label}: ${err instanceof Error ? err.message : err}`);
-          await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
-        }
+      return;
+    }
+
+    if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+
+    const responseText = finalResultText ?? streamText;
+    const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(responseText);
+    const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
+
+    if (reactionEmoji) {
+      await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
+        console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+
+    if (cleanedText) {
+      const firstChunk = cleanedText.slice(0, TELEGRAM_STREAM_MAX_LEN);
+      if (streamMsgId) {
+        await editStreamMessage(config.token, chatId, streamMsgId, firstChunk);
+      } else {
+        await sendMessage(config.token, chatId, firstChunk, threadId);
       }
-      if (!cleanedText && filePaths.length === 0) {
+      if (cleanedText.length > TELEGRAM_STREAM_MAX_LEN) {
+        await sendMessage(config.token, chatId, cleanedText.slice(TELEGRAM_STREAM_MAX_LEN), threadId);
+      }
+    } else if (filePaths.length === 0) {
+      if (streamMsgId) {
+        await editStreamMessage(config.token, chatId, streamMsgId, "(empty response)");
+      } else {
         await sendMessage(config.token, chatId, "(empty response)", threadId);
+      }
+    } else if (streamMsgId) {
+      // Directives will handle the output — drop the placeholder.
+      await deleteStreamMessage(config.token, chatId, streamMsgId);
+    }
+
+    for (const fp of filePaths) {
+      try {
+        await sendDocumentToChat(config.token, chatId, fp, threadId);
+      } catch (err) {
+        console.error(`[Telegram] Failed to send document for ${label}: ${err instanceof Error ? err.message : err}`);
+        await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
       }
     }
   } catch (err) {

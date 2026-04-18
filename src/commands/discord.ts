@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, markThreadInterrupted } from "../sessionManager";
@@ -181,6 +181,60 @@ async function sendMessage(
       body.components = components;
     }
     await discordApi(token, "POST", `/channels/${channelId}/messages`, body);
+  }
+}
+
+// Discord message limit is 2000 chars per message.
+const DISCORD_STREAM_MAX_LEN = 1900;
+// Discord allows 5 edits/5s per channel; 1.5s keeps us well inside.
+const DISCORD_STREAM_UPDATE_INTERVAL_MS = 1500;
+
+/**
+ * Post a single streaming-anchor message and return its id.
+ * Returns null if the API call fails.
+ */
+async function postStreamMessageDiscord(
+  token: string,
+  channelId: string,
+  text: string,
+): Promise<string | null> {
+  const clipped = text.length > DISCORD_STREAM_MAX_LEN ? text.slice(0, DISCORD_STREAM_MAX_LEN) : text;
+  try {
+    const res = await discordApi<{ id: string }>(token, "POST", `/channels/${channelId}/messages`, {
+      content: clipped,
+    });
+    return res?.id ?? null;
+  } catch (err) {
+    debugLog(`postStreamMessage failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+async function editStreamMessageDiscord(
+  token: string,
+  channelId: string,
+  messageId: string,
+  text: string,
+): Promise<void> {
+  const clipped = text.length > DISCORD_STREAM_MAX_LEN ? text.slice(0, DISCORD_STREAM_MAX_LEN) : text;
+  try {
+    await discordApi(token, "PATCH", `/channels/${channelId}/messages/${messageId}`, {
+      content: clipped,
+    });
+  } catch (err) {
+    debugLog(`editStreamMessage failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+async function deleteStreamMessageDiscord(
+  token: string,
+  channelId: string,
+  messageId: string,
+): Promise<void> {
+  try {
+    await discordApi(token, "DELETE", `/channels/${channelId}/messages/${messageId}`);
+  } catch (err) {
+    debugLog(`deleteStreamMessage failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -672,21 +726,71 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const prefixedPrompt = promptParts.join("\n");
     // Use thread-specific session if message is in a known thread
     const threadId = knownThreads.has(channelId) ? channelId : undefined;
-    const result = await runUserMessage("discord", prefixedPrompt, threadId);
 
-    if (result.exitCode !== 0) {
-      // /stop already sent its own acknowledgement — don't double up with an error.
-      if (result.stderr === "Force-stopped by user.") return;
-      const errDetails = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}):\n${errDetails || "Unknown error (no output)"}`);
-    } else {
-      const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
-      if (reactionEmoji) {
-        await sendReaction(config.token, channelId, message.id, reactionEmoji).catch((err) => {
-          console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
-        });
+    // Streaming reply: defer initial post until first chunk, throttle PATCH edits.
+    let streamMsgId: string | null = null;
+    let streamMsgPromise: Promise<string | null> | null = null;
+    let streamText = "";
+    let lastStreamUpdate = 0;
+    let finalResultText: string | null = null;
+    let aborted = false;
+
+    try {
+      await streamUserMessage(
+        "discord",
+        prefixedPrompt,
+        (text: string) => {
+          streamText = text;
+          const now = Date.now();
+          if (!streamMsgPromise) {
+            streamMsgPromise = postStreamMessageDiscord(config.token, channelId, text);
+            streamMsgPromise.then((id) => { streamMsgId = id; }).catch(() => {});
+            lastStreamUpdate = now;
+          } else if (streamMsgId && now - lastStreamUpdate >= DISCORD_STREAM_UPDATE_INTERVAL_MS) {
+            lastStreamUpdate = now;
+            editStreamMessageDiscord(config.token, channelId, streamMsgId, text).catch(() => {});
+          }
+        },
+        () => { /* onUnblock */ },
+        threadId,
+        (text: string) => { finalResultText = text; },
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      aborted = /abort/i.test(errMsg) || (err instanceof Error && err.name === "AbortError");
+      if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+      if (aborted) {
+        if (streamMsgId) await deleteStreamMessageDiscord(config.token, channelId, streamMsgId);
+        return;
       }
-      await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      if (streamMsgId) {
+        await editStreamMessageDiscord(config.token, channelId, streamMsgId, `Error: ${errMsg}`);
+      } else {
+        await sendMessage(config.token, channelId, `Error: ${errMsg}`);
+      }
+      return;
+    }
+
+    if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+
+    const responseText = finalResultText ?? streamText;
+    const { cleanedText, reactionEmoji } = extractReactionDirective(responseText);
+
+    if (reactionEmoji) {
+      await sendReaction(config.token, channelId, message.id, reactionEmoji).catch((err) => {
+        console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+
+    const finalText = cleanedText || "(empty response)";
+    const firstChunk = finalText.slice(0, DISCORD_STREAM_MAX_LEN);
+    if (streamMsgId) {
+      await editStreamMessageDiscord(config.token, channelId, streamMsgId, firstChunk);
+    } else {
+      await sendMessage(config.token, channelId, firstChunk);
+    }
+    if (finalText.length > DISCORD_STREAM_MAX_LEN) {
+      await sendMessage(config.token, channelId, finalText.slice(DISCORD_STREAM_MAX_LEN));
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
