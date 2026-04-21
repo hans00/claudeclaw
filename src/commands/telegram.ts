@@ -1,7 +1,7 @@
 import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { getSettings, loadSettings, type TelegramChatConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
-import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken } from "../silent";
+import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1091,6 +1091,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         () => { /* onUnblock — typing interval already shows progress */ },
         undefined,
         (text: string) => { finalResultText = text; },
+        isGroup ? SILENT_REPLY_PROMPT : undefined,
       );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

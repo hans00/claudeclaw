@@ -1,4 +1,5 @@
 import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
+import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
@@ -1033,6 +1034,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         prefixedPrompt,
         (text: string) => {
           streamText = text;
+          // Don't post a placeholder while the stream prefix still looks like NO_REPLY.
+          if (isSilentReplyPrefixText(text)) return;
           const now = Date.now();
 
           if (!streamMsgPromise) {
@@ -1048,6 +1051,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         () => { /* onUnblock */ },
         sessionThreadId,
         (text: string) => { finalResultText = text; },
+        isDirectMessage ? undefined : SILENT_REPLY_PROMPT,
       );
     } catch (err) {
       clearInterval(statusRefreshInterval);
@@ -1070,7 +1074,19 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // Stop refreshing status
     clearInterval(statusRefreshInterval);
 
-    const responseText = finalResultText ?? streamText;
+    const rawResponseText = finalResultText ?? streamText;
+
+    // Agent asked to stay silent — drop any placeholder we posted mid-stream and bail.
+    if (isSilentReplyText(rawResponseText)) {
+      await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
+      await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
+      if (streamMsgTs) {
+        await deleteMessage(config.botToken, channelId, streamMsgTs).catch(() => {});
+      }
+      return;
+    }
+
+    const responseText = stripSilentToken(rawResponseText);
 
     if (!responseText) {
       // Empty response

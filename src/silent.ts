@@ -9,6 +9,17 @@
  */
 export const SILENT_REPLY_TOKEN = "NO_REPLY";
 
+/**
+ * Append to the system prompt in multi-party contexts (group chats, public
+ * channels) so the agent can opt out of replying when its turn isn't warranted
+ * — e.g. two humans talking to each other, an off-topic aside, or a reaction
+ * that doesn't need a verbal response.
+ */
+export const SILENT_REPLY_PROMPT = [
+  "## Silent Replies",
+  "When you have nothing to say, respond with ONLY: `NO_REPLY`",
+].join("\n");
+
 const EXACT_RE = /^\s*NO_REPLY\s*$/;
 const TRAILING_RE = /\s*NO_REPLY\s*$/;
 

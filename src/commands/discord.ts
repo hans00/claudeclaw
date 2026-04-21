@@ -2,7 +2,7 @@ import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactC
 import { getSettings, loadSettings, type DiscordChannelConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, markThreadInterrupted } from "../sessionManager";
-import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken } from "../silent";
+import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -854,6 +854,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
         () => { /* onUnblock */ },
         threadId,
         (text: string) => { finalResultText = text; },
+        isGuild ? SILENT_REPLY_PROMPT : undefined,
       );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

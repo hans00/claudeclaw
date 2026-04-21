@@ -433,7 +433,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, threadId?: string, systemAppend?: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -503,6 +503,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (systemAppend && systemAppend.trim()) appendParts.push(systemAppend.trim());
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
@@ -640,8 +641,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId), threadId);
+export async function run(name: string, prompt: string, threadId?: string, systemAppend?: string): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, systemAppend), threadId);
 }
 
 async function streamClaude(
@@ -651,6 +652,7 @@ async function streamClaude(
   onUnblock: () => void,
   threadId?: string,
   onResult?: (text: string) => void,
+  systemAppend?: string,
 ): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -672,6 +674,7 @@ async function streamClaude(
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (systemAppend && systemAppend.trim()) appendParts.push(systemAppend.trim());
 
   // Build SDK options
   const sdkOptions: Record<string, unknown> = {
@@ -816,9 +819,10 @@ export async function streamUserMessage(
   onUnblock: () => void,
   threadId?: string,
   onResult?: (text: string) => void,
+  systemAppend?: string,
 ): Promise<void> {
   const wrapped = await buildUserPromptPrefix(prompt, threadId);
-  return enqueue(() => streamClaude(name, wrapped, onChunk, onUnblock, threadId, onResult), threadId);
+  return enqueue(() => streamClaude(name, wrapped, onChunk, onUnblock, threadId, onResult, systemAppend), threadId);
 }
 
 const INTERRUPT_NOTE = [
@@ -852,9 +856,9 @@ async function buildUserPromptPrefix(prompt: string, threadId?: string): Promise
   return parts.join("\n");
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+export async function runUserMessage(name: string, prompt: string, threadId?: string, systemAppend?: string): Promise<RunResult> {
   const wrapped = await buildUserPromptPrefix(prompt, threadId);
-  return run(name, wrapped, threadId);
+  return run(name, wrapped, threadId, systemAppend);
 }
 
 /**
