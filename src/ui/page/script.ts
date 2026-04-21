@@ -957,8 +957,10 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     // ── Chat ──
     const tabDashboardBtn = $("tab-dashboard");
     const tabChatBtn = $("tab-chat");
+    const tabHistoryBtn = $("tab-history");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
+    const historyPanel = $("history-panel");
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
@@ -977,8 +979,8 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     })();
 
     function setActiveTab(tab) {
-      const allBtns = [tabDashboardBtn, tabChatBtn];
-      const allPanels = [dashboardPanel, chatPanel];
+      const allBtns = [tabDashboardBtn, tabChatBtn, tabHistoryBtn];
+      const allPanels = [dashboardPanel, chatPanel, historyPanel];
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
@@ -986,6 +988,11 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
+      } else if (tab === "history") {
+        tabHistoryBtn && tabHistoryBtn.classList.add("tab-btn-active");
+        tabHistoryBtn && tabHistoryBtn.setAttribute("aria-selected", "true");
+        if (historyPanel) historyPanel.hidden = false;
+        loadHistorySessions();
       } else {
         tabChatBtn && tabChatBtn.classList.add("tab-btn-active");
         tabChatBtn && tabChatBtn.setAttribute("aria-selected", "true");
@@ -996,6 +1003,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
     if (tabChatBtn) tabChatBtn.addEventListener("click", () => setActiveTab("chat"));
+    if (tabHistoryBtn) tabHistoryBtn.addEventListener("click", () => setActiveTab("history"));
 
     renderChatHistory();
 
@@ -1250,4 +1258,184 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         var elapsedEl = chatMessages.querySelector(".chat-msg-elapsed");
         if (elapsedEl) elapsedEl.textContent = fmtElapsed(Date.now() - chatStartedAt);
       }
-    }, 1000);`;
+    }, 1000);
+
+    // ── History ──
+    const historyList = $("history-list");
+    const historyTranscript = $("history-transcript");
+    const historyMainHead = $("history-main-head");
+    const historyRefreshBtn = $("history-refresh");
+    let historySelectedId = "";
+    let historySessionsCache = [];
+
+    function fmtHistoryTimestamp(ts) {
+      if (!ts) return "";
+      try {
+        const d = new Date(ts);
+        if (Number.isNaN(d.getTime())) return "";
+        return formatOffsetDate(d, {
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: use12Hour,
+        });
+      } catch (_) { return ""; }
+    }
+
+    function fmtBytes(n) {
+      if (n == null) return "";
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      return (n / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    function renderSessionsList(sessions) {
+      if (!historyList) return;
+      if (!Array.isArray(sessions) || !sessions.length) {
+        historyList.innerHTML = '<div class="history-empty">No sessions yet.</div>';
+        return;
+      }
+      historyList.innerHTML = sessions.map(function(s) {
+        const active = s.sessionId === historySelectedId;
+        const when = fmtHistoryTimestamp(s.lastUsedAt || s.fileMtime);
+        const turns = s.turnCount != null ? (s.turnCount + " turns") : "";
+        const bytes = s.fileSize != null ? fmtBytes(s.fileSize) : "";
+        const metaParts = [];
+        if (when) metaParts.push(when);
+        if (turns) metaParts.push(turns);
+        if (bytes) metaParts.push(bytes);
+        if (!s.hasFile) metaParts.push("no transcript");
+        const kindCls = "history-item-kind history-item-kind-" + esc(s.kind);
+        return (
+          '<button class="history-item' + (active ? ' history-item-active' : '') + '" type="button" data-session-id="' + escAttr(s.sessionId) + '"' + (s.hasFile ? '' : ' data-no-file="1"') + '>' +
+            '<div class="history-item-label">' +
+              '<span class="' + kindCls + '">' + esc(s.kind) + '</span>' +
+              '<span>' + esc(s.label || s.sessionId) + '</span>' +
+            '</div>' +
+            '<div class="history-item-meta">' + esc(metaParts.join(" · ")) + '</div>' +
+          '</button>'
+        );
+      }).join("");
+    }
+
+    async function loadHistorySessions() {
+      if (!historyList) return;
+      historyList.innerHTML = '<div class="history-empty">Loading sessions…</div>';
+      try {
+        const res = await fetch("/api/sessions");
+        const out = await res.json();
+        if (!out.ok) throw new Error(out.error || "failed");
+        historySessionsCache = Array.isArray(out.sessions) ? out.sessions : [];
+        renderSessionsList(historySessionsCache);
+      } catch (err) {
+        historyList.innerHTML = '<div class="history-empty">Failed to load sessions: ' + esc(String(err)) + '</div>';
+      }
+    }
+
+    function renderTranscriptBlock(block) {
+      if (!block || typeof block !== "object") return "";
+      if (block.kind === "text") {
+        return '<div class="ht-block ht-block-text">' + esc(String(block.text || "")) + '</div>';
+      }
+      if (block.kind === "thinking") {
+        return '<div class="ht-block ht-block-thinking">' + esc(String(block.text || "")) + '</div>';
+      }
+      if (block.kind === "tool_use") {
+        let payload = "";
+        try { payload = JSON.stringify(block.input, null, 2); } catch (_) { payload = String(block.input); }
+        return (
+          '<div class="ht-block ht-block-tool-use">' +
+            '<div class="ht-tool-name">' + esc(String(block.name || "tool")) + '</div>' +
+            '<pre class="ht-tool-input">' + esc(payload || "") + '</pre>' +
+          '</div>'
+        );
+      }
+      if (block.kind === "tool_result") {
+        const cls = block.isError ? "ht-block ht-block-tool-result ht-block-tool-result-error" : "ht-block ht-block-tool-result";
+        return '<div class="' + cls + '">' + esc(String(block.text || "")) + '</div>';
+      }
+      return "";
+    }
+
+    function renderTranscript(transcript) {
+      if (!historyTranscript) return;
+      if (!transcript || !Array.isArray(transcript.turns) || !transcript.turns.length) {
+        historyTranscript.innerHTML = '<div class="history-empty">This session has no displayable turns.</div>';
+        return;
+      }
+      const truncated = transcript.truncated
+        ? '<div class="ht-truncated">Showing most recent ' + transcript.turns.length + ' of ' + transcript.totalLines + ' lines.</div>'
+        : '';
+      const turnsHtml = transcript.turns.map(function(turn) {
+        const roleCls = "ht-turn ht-turn-" + esc(turn.role || "user");
+        const ts = turn.timestamp ? ('<span class="ht-ts">' + esc(fmtHistoryTimestamp(turn.timestamp)) + '</span>') : "";
+        const blocks = (turn.blocks || []).map(renderTranscriptBlock).join("");
+        return (
+          '<div class="' + roleCls + '">' +
+            '<div class="ht-role">' + esc(turn.role || "") + ts + '</div>' +
+            blocks +
+          '</div>'
+        );
+      }).join("");
+      historyTranscript.innerHTML = truncated + turnsHtml;
+      historyTranscript.scrollTop = 0;
+    }
+
+    function updateHistoryMainHead(session, transcript) {
+      if (!historyMainHead) return;
+      if (!session) {
+        historyMainHead.innerHTML =
+          '<div class="history-main-title">Select a session</div>' +
+          '<div class="history-main-meta"></div>';
+        return;
+      }
+      const metaParts = [];
+      metaParts.push(session.kind);
+      if (session.lastUsedAt || session.fileMtime) metaParts.push(fmtHistoryTimestamp(session.lastUsedAt || session.fileMtime));
+      if (transcript && typeof transcript.totalLines === "number") metaParts.push(transcript.totalLines + " lines");
+      if (session.fileSize != null) metaParts.push(fmtBytes(session.fileSize));
+      historyMainHead.innerHTML =
+        '<div class="history-main-title">' + esc(session.label || session.sessionId) + '</div>' +
+        '<div class="history-main-meta">' + esc(metaParts.filter(Boolean).join(" · ")) + '</div>';
+    }
+
+    async function loadTranscript(sessionId) {
+      if (!historyTranscript) return;
+      historySelectedId = sessionId;
+      renderSessionsList(historySessionsCache);
+      const session = historySessionsCache.find(function(s) { return s.sessionId === sessionId; });
+      updateHistoryMainHead(session, null);
+      if (session && !session.hasFile) {
+        historyTranscript.innerHTML = '<div class="history-empty">No transcript file on disk for this session.</div>';
+        return;
+      }
+      historyTranscript.innerHTML = '<div class="history-empty">Loading transcript…</div>';
+      try {
+        const res = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/transcript");
+        const out = await res.json();
+        if (!out.ok) throw new Error(out.error || "failed");
+        updateHistoryMainHead(session, out.transcript);
+        renderTranscript(out.transcript);
+      } catch (err) {
+        historyTranscript.innerHTML = '<div class="history-empty">Failed: ' + esc(String(err)) + '</div>';
+      }
+    }
+
+    if (historyList) {
+      historyList.addEventListener("click", function(event) {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const button = target.closest("[data-session-id]");
+        if (!button || !(button instanceof HTMLElement)) return;
+        const id = button.getAttribute("data-session-id") || "";
+        if (!id) return;
+        loadTranscript(id);
+      });
+    }
+
+    if (historyRefreshBtn) {
+      historyRefreshBtn.addEventListener("click", function() {
+        loadHistorySessions();
+      });
+    }`;

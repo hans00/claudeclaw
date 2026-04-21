@@ -115,6 +115,7 @@ ${pageStyles}
     <nav class="tab-nav" role="tablist" aria-label="Main navigation">
       <button class="tab-btn tab-btn-active" id="tab-dashboard" type="button" role="tab" aria-selected="true" aria-controls="dashboard-panel">Dashboard</button>
       <button class="tab-btn" id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
+      <button class="tab-btn" id="tab-history" type="button" role="tab" aria-selected="false" aria-controls="history-panel">History</button>
     </nav>
     <div id="dashboard-panel">
     <section class="hero">
@@ -199,6 +200,26 @@ ${pageStyles}
           <button id="chat-send" class="chat-send" type="submit">Send</button>
         </form>
       </div>
+    </div>
+    <div id="history-panel" class="history-panel" hidden>
+      <aside class="history-sidebar" id="history-sidebar">
+        <div class="history-sidebar-head">
+          <span>Sessions</span>
+          <button class="history-refresh" id="history-refresh" type="button" aria-label="Refresh">↻</button>
+        </div>
+        <div class="history-list" id="history-list">
+          <div class="history-empty">Loading sessions…</div>
+        </div>
+      </aside>
+      <section class="history-main" id="history-main">
+        <div class="history-main-head" id="history-main-head">
+          <div class="history-main-title">Select a session</div>
+          <div class="history-main-meta"></div>
+        </div>
+        <div class="history-transcript" id="history-transcript">
+          <div class="history-empty">Pick a session on the left to view its transcript.</div>
+        </div>
+      </section>
     </div>
   </main>
 

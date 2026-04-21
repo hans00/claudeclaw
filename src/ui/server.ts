@@ -5,6 +5,7 @@ import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/sta
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
+import { listSessions, readTranscript } from "./services/transcripts";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -147,6 +148,25 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       if (url.pathname === "/api/logs") {
         const tail = clampInt(url.searchParams.get("tail"), 200, 20, 2000);
         return json(await readLogs(tail));
+      }
+
+      if (url.pathname === "/api/sessions") {
+        try {
+          return json({ ok: true, sessions: await listSessions() });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      const transcriptMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/transcript$/);
+      if (transcriptMatch) {
+        try {
+          const transcript = await readTranscript(transcriptMatch[1]);
+          if (!transcript) return json({ ok: false, error: "transcript not found" }, 404);
+          return json({ ok: true, transcript });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
       }
 
       if (url.pathname === "/api/chat" && req.method === "POST") {
