@@ -56,8 +56,8 @@ const DEFAULT_SETTINGS: Settings = {
     excludeWindows: [],
     forwardToTelegram: true,
   },
-  telegram: { token: "", allowedUserIds: [] },
-  discord: { token: "", allowedUserIds: [], listenChannels: [], allowedBotIds: [] },
+  telegram: { token: "", allowedUserIds: [], chats: {} },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], allowedBotIds: [], channels: {} },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   line: {
     channelAccessToken: "",
@@ -94,16 +94,48 @@ export interface HeartbeatConfig {
   forwardToTelegram: boolean;
 }
 
+/** Per-chat trigger overrides for Telegram groups/supergroups.
+ *  Keyed by chat ID (as a string) in TelegramConfig.chats. */
+export interface TelegramChatConfig {
+  /** When false, bot ignores the chat entirely. Default: true. */
+  enabled?: boolean;
+  /** When true, bot only responds when explicitly mentioned / replied to.
+   *  When false, bot reads every message in the chat. Default: true for groups. */
+  requireMention?: boolean;
+  /** When true, a message that @-mentions another user (and not the bot) is
+   *  treated as not-for-the-bot and buffered as ambient context. Default: true. */
+  ignoreOtherMentions?: boolean;
+}
+
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
+  /** Per-chat config overrides keyed by chat ID. */
+  chats: Record<string, TelegramChatConfig>;
+}
+
+/** Per-channel trigger overrides for Discord guild channels and threads.
+ *  Keyed by channel or thread ID in DiscordConfig.channels. */
+export interface DiscordChannelConfig {
+  /** When false, bot ignores the channel entirely. Default: true. */
+  enabled?: boolean;
+  /** When true, bot only responds when explicitly mentioned / replied to.
+   *  When false, bot reads every message in the channel (legacy listen mode). */
+  requireMention?: boolean;
+  /** When true, a message that mentions another user (and not the bot) is
+   *  treated as not-for-the-bot and buffered as ambient context. Default: true. */
+  ignoreOtherMentions?: boolean;
 }
 
 export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
-  listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
+  /** Legacy: channel IDs where bot responds to every message (no mention needed).
+   *  Equivalent to channels[id].requireMention = false. Kept for backward compat. */
+  listenChannels: string[];
   allowedBotIds: string[]; // Bot IDs allowed to trigger (mention only, not listen_channel)
+  /** Per-channel config overrides keyed by channel or thread ID. */
+  channels: Record<string, DiscordChannelConfig>;
 }
 
 export interface SlackConfig {
@@ -320,6 +352,7 @@ function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = [
     telegram: {
       token: raw.telegram?.token ?? "",
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
+      chats: parseTelegramChats(raw.telegram?.chats),
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
@@ -334,6 +367,7 @@ function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = [
       allowedBotIds: Array.isArray(raw.discord?.allowedBotIds)
         ? raw.discord.allowedBotIds.map(String)
         : [],
+      channels: parseDiscordChannels(raw.discord?.channels),
     },
     slack: {
       botToken: typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : "",
@@ -438,6 +472,36 @@ function parseExcludeWindows(value: unknown): HeartbeatExcludeWindow[] {
 
 function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): number {
   return resolveTimezoneOffsetMinutes(value, timezoneFallback);
+}
+
+function parseDiscordChannels(raw: unknown): Record<string, DiscordChannelConfig> {
+  const out: Record<string, DiscordChannelConfig> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [channelId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const cfg = value as Record<string, unknown>;
+    const entry: DiscordChannelConfig = {};
+    if (typeof cfg.enabled === "boolean") entry.enabled = cfg.enabled;
+    if (typeof cfg.requireMention === "boolean") entry.requireMention = cfg.requireMention;
+    if (typeof cfg.ignoreOtherMentions === "boolean") entry.ignoreOtherMentions = cfg.ignoreOtherMentions;
+    out[String(channelId)] = entry;
+  }
+  return out;
+}
+
+function parseTelegramChats(raw: unknown): Record<string, TelegramChatConfig> {
+  const out: Record<string, TelegramChatConfig> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [chatId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const cfg = value as Record<string, unknown>;
+    const entry: TelegramChatConfig = {};
+    if (typeof cfg.enabled === "boolean") entry.enabled = cfg.enabled;
+    if (typeof cfg.requireMention === "boolean") entry.requireMention = cfg.requireMention;
+    if (typeof cfg.ignoreOtherMentions === "boolean") entry.ignoreOtherMentions = cfg.ignoreOtherMentions;
+    out[String(chatId)] = entry;
+  }
+  return out;
 }
 
 /**

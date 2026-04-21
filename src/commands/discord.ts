@@ -1,7 +1,8 @@
 import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, type DiscordChannelConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, markThreadInterrupted } from "../sessionManager";
+import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken } from "../silent";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -288,28 +289,89 @@ async function rejoinThreads(token: string): Promise<void> {
 
 // --- Guild trigger logic ---
 
-function guildTriggerReason(message: DiscordMessage): string | null {
-  // Reply to bot
+function isBotExplicitlyMentioned(message: DiscordMessage): string | null {
   if (botUserId && message.referenced_message?.author?.id === botUserId) return "reply_to_bot";
-
-  // Mention via mentions array
   if (botUserId && message.mentions.some((m) => m.id === botUserId)) return "mention";
-
-  // Mention in content (fallback)
   if (botUserId && message.content.includes(`<@${botUserId}>`)) return "mention_in_content";
-
-  // Text mention by username (for bots that forget to use proper mentions)
   if (botUsername && message.content.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return "text_mention";
-
-  // Listen channel (respond to all messages, no mention needed)
-  const config = getSettings().discord;
-  if (config.listenChannels.includes(message.channel_id)) return "listen_channel";
-
-  // Thread whose parent channel is a listen channel
-  const threadInfo = knownThreads.get(message.channel_id);
-  if (threadInfo && config.listenChannels.includes(threadInfo.parentId)) return "listen_channel_thread";
-
   return null;
+}
+
+// True if the message @-mentions someone other than the bot. Used with
+// ignoreOtherMentions to avoid hijacking conversations addressed to others.
+function mentionsOthersOnly(message: DiscordMessage): boolean {
+  if (message.mentions.length === 0) return false;
+  if (isBotExplicitlyMentioned(message)) return false;
+  const others = botUserId
+    ? message.mentions.filter((m) => m.id !== botUserId)
+    : message.mentions;
+  return others.length > 0;
+}
+
+interface ResolvedChannelTrigger {
+  enabled: boolean;
+  requireMention: boolean;
+  ignoreOtherMentions: boolean;
+}
+
+// Resolve effective per-channel trigger config. Order of precedence:
+//   1. explicit channels[channelId] entry
+//   2. for threads, channels[parentId] entry (so parent config flows to threads)
+//   3. legacy listenChannels → requireMention: false
+//   4. defaults: enabled=true, requireMention=true, ignoreOtherMentions=true
+function resolveChannelTrigger(channelId: string): ResolvedChannelTrigger {
+  const config = getSettings().discord;
+  const direct: DiscordChannelConfig | undefined = config.channels?.[channelId];
+  const parentId = knownThreads.get(channelId)?.parentId;
+  const parent: DiscordChannelConfig | undefined = parentId ? config.channels?.[parentId] : undefined;
+
+  const listenMatch = config.listenChannels.includes(channelId)
+    || (parentId ? config.listenChannels.includes(parentId) : false);
+
+  const enabled = direct?.enabled ?? parent?.enabled ?? true;
+  const requireMention =
+    direct?.requireMention
+    ?? parent?.requireMention
+    ?? (listenMatch ? false : true);
+  const ignoreOtherMentions =
+    direct?.ignoreOtherMentions
+    ?? parent?.ignoreOtherMentions
+    ?? true;
+
+  return { enabled, requireMention, ignoreOtherMentions };
+}
+
+// Buffer of ignored-but-observed channel messages, surfaced as context on the
+// next successful trigger so ambient group chatter isn't lost.
+interface PendingChannelMessage {
+  authorName: string;
+  content: string;
+  mentionedNames: string[];
+  timestamp: number;
+}
+const MAX_PENDING_PER_CHANNEL = 20;
+const pendingChannelMessages: Map<string, PendingChannelMessage[]> = new Map();
+
+function bufferPendingMessage(channelId: string, entry: PendingChannelMessage): void {
+  const list = pendingChannelMessages.get(channelId) ?? [];
+  list.push(entry);
+  while (list.length > MAX_PENDING_PER_CHANNEL) list.shift();
+  pendingChannelMessages.set(channelId, list);
+}
+
+function consumePendingMessages(channelId: string): PendingChannelMessage[] {
+  const list = pendingChannelMessages.get(channelId) ?? [];
+  if (list.length > 0) pendingChannelMessages.delete(channelId);
+  return list;
+}
+
+function formatPendingContext(entries: PendingChannelMessage[]): string {
+  return entries
+    .map((m) => {
+      const to = m.mentionedNames.length > 0 ? ` → ${m.mentionedNames.join(", ")}` : "";
+      return `- ${m.authorName}${to}: ${m.content}`;
+    })
+    .join("\n");
 }
 
 // --- Attachment handling ---
@@ -463,13 +525,6 @@ async function respondToInteraction(
 async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
   const config = getSettings().discord;
 
-  // Ignore bot messages, except allowedBotIds (mention only, not listen_channel)
-  if (message.author.bot) {
-    if (!config.allowedBotIds.includes(message.author.id)) return;
-    const reason = guildTriggerReason(message);
-    if (!reason || reason === "listen_channel") return;
-  }
-
   const userId = message.author.id;
   const channelId = message.channel_id;
   const isDM = !message.guild_id;
@@ -492,13 +547,49 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
   }
 
-  // Guild trigger check
-  const triggerReason = isGuild ? guildTriggerReason(message) : "direct_message";
-  if (isGuild && !triggerReason) {
-    const threadInfo = knownThreads.get(channelId);
-    console.log(`[Discord][DIAG] SKIP channel=${channelId} guild=${message.guild_id} inKnown=${knownThreads.has(channelId)} threadInfo=${JSON.stringify(threadInfo)} knownSize=${knownThreads.size} listenCh=${JSON.stringify(config.listenChannels)} text="${content.slice(0, 40)}"`);
-    return;
+  // Per-channel trigger config (defaults to requireMention=true, ignoreOtherMentions=true).
+  const trigger = isGuild
+    ? resolveChannelTrigger(channelId)
+    : { enabled: true, requireMention: false, ignoreOtherMentions: false };
+
+  // Ignore bot messages, except allowedBotIds — and then only when they explicitly mention us.
+  if (message.author.bot) {
+    if (!config.allowedBotIds.includes(message.author.id)) return;
+    if (isGuild && !isBotExplicitlyMentioned(message)) return;
   }
+
+  let triggerReason: string | null = isDM ? "direct_message" : null;
+  if (isGuild) {
+    if (!trigger.enabled) {
+      debugLog(`Skip channel=${channelId}: channel disabled by config`);
+      return;
+    }
+    const explicit = isBotExplicitlyMentioned(message);
+    const othersOnly = mentionsOthersOnly(message);
+
+    if (explicit) {
+      triggerReason = explicit;
+    } else if (trigger.ignoreOtherMentions && othersOnly) {
+      bufferPendingMessage(channelId, {
+        authorName: message.author.username,
+        content: content,
+        mentionedNames: message.mentions.map((m) => m.username),
+        timestamp: Date.now(),
+      });
+      debugLog(`Buffered mention-to-others: channel=${channelId} from=${message.author.username}`);
+      return;
+    } else if (!trigger.requireMention) {
+      triggerReason = "listen_channel";
+    }
+
+    if (!triggerReason) {
+      debugLog(
+        `Skip channel=${channelId}: requireMention=true, no explicit mention from=${message.author.username} text="${content.slice(0, 40)}"`,
+      );
+      return;
+    }
+  }
+
   debugLog(
     `Handle message channel=${channelId} from=${userId} reason=${triggerReason} text="${content.slice(0, 80)}"`,
   );
@@ -674,7 +765,13 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
 
     // Build prompt (same pattern as Telegram)
+    const bufferedContext = consumePendingMessages(channelId);
     const promptParts = [`[Discord from ${label}]`];
+    if (bufferedContext.length > 0) {
+      promptParts.push(
+        `Recent channel messages not addressed to you (context only, do not reply to them):\n${formatPendingContext(bufferedContext)}`,
+      );
+    }
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
@@ -713,6 +810,11 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     const drainStreamBuffer = (): void => {
       postingInFlight = postingInFlight.then(async () => {
+        // If the model's output so far still looks like it could be a silent
+        // NO_REPLY reply, hold off posting — we'll know for sure when either
+        // more content arrives or the stream ends.
+        if (isSilentReplyPrefixText(sanitizeStreamText(streamTextFull))) return;
+
         while (true) {
           const sanitized = sanitizeStreamText(streamTextFull);
           const pending = sanitized.slice(postedLen);
@@ -765,7 +867,17 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     await postingInFlight.catch(() => {});
 
     const responseText = finalResultText ?? streamTextFull;
-    const { cleanedText, reactionEmoji } = extractReactionDirective(responseText);
+
+    // Agent-initiated silent reply: if the model decided this message shouldn't
+    // get a response, suppress it entirely. Reactions still flow through — a
+    // lightweight ack is fine even when no reply text is sent.
+    if (isSilentReplyText(responseText)) {
+      debugLog(`NO_REPLY: suppressing reply to ${label}`);
+      return;
+    }
+
+    const strippedResponse = stripSilentToken(responseText);
+    const { cleanedText, reactionEmoji } = extractReactionDirective(strippedResponse);
 
     if (reactionEmoji) {
       await sendReaction(config.token, channelId, message.id, reactionEmoji).catch((err) => {

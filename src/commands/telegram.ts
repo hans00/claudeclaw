@@ -1,6 +1,7 @@
 import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, type TelegramChatConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
+import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken } from "../silent";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -483,7 +484,7 @@ async function sendReaction(token: string, chatId: number, messageId: number, em
 let botUsername: string | null = null;
 let botId: number | null = null;
 
-function groupTriggerReason(message: TelegramMessage): string | null {
+function isBotExplicitlyMentioned(message: TelegramMessage): string | null {
   if (botId && message.reply_to_message?.from?.id === botId) return "reply_to_bot";
   const { text, entities } = getMessageTextAndEntities(message);
   if (!text) return null;
@@ -504,6 +505,99 @@ function groupTriggerReason(message: TelegramMessage): string | null {
   }
 
   return null;
+}
+
+// True if the message @-mentions someone other than the bot. Mirrors Discord's
+// mentionsOthersOnly for the ignoreOtherMentions config flag.
+function mentionsOthersOnly(message: TelegramMessage): boolean {
+  const { text, entities } = getMessageTextAndEntities(message);
+  if (!text || !entities || entities.length === 0) return false;
+  const botHandle = botUsername ? `@${botUsername.toLowerCase()}` : null;
+  let hasOthers = false;
+  let hasBot = false;
+  for (const entity of entities) {
+    if (entity.type === "mention") {
+      const value = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
+      if (botHandle && value === botHandle) hasBot = true;
+      else hasOthers = true;
+    } else if (entity.type === "text_mention") {
+      const user = (entity as { user?: TelegramUser }).user;
+      if (user && botId && user.id === botId) hasBot = true;
+      else hasOthers = true;
+    }
+  }
+  return hasOthers && !hasBot;
+}
+
+interface ResolvedChatTrigger {
+  enabled: boolean;
+  requireMention: boolean;
+  ignoreOtherMentions: boolean;
+}
+
+// Resolve effective per-chat trigger config. For forum supergroups, the same
+// chat-level entry applies to every topic — we don't split by thread.
+function resolveChatTrigger(chatId: number): ResolvedChatTrigger {
+  const config = getSettings().telegram;
+  const entry: TelegramChatConfig | undefined = config.chats?.[String(chatId)];
+  return {
+    enabled: entry?.enabled ?? true,
+    requireMention: entry?.requireMention ?? true,
+    ignoreOtherMentions: entry?.ignoreOtherMentions ?? true,
+  };
+}
+
+// Buffer of ignored-but-observed group messages, surfaced as context on the
+// next successful trigger so the bot can follow what was happening before it
+// was pinged.
+interface PendingChatMessage {
+  authorName: string;
+  content: string;
+  mentionedNames: string[];
+  timestamp: number;
+}
+const MAX_PENDING_PER_CHAT = 20;
+const pendingChatMessages: Map<string, PendingChatMessage[]> = new Map();
+
+function pendingKey(chatId: number, threadId?: number): string {
+  return threadId ? `${chatId}:${threadId}` : String(chatId);
+}
+
+function bufferPendingChatMessage(key: string, entry: PendingChatMessage): void {
+  const list = pendingChatMessages.get(key) ?? [];
+  list.push(entry);
+  while (list.length > MAX_PENDING_PER_CHAT) list.shift();
+  pendingChatMessages.set(key, list);
+}
+
+function consumePendingChatMessages(key: string): PendingChatMessage[] {
+  const list = pendingChatMessages.get(key) ?? [];
+  if (list.length > 0) pendingChatMessages.delete(key);
+  return list;
+}
+
+function formatPendingChatContext(entries: PendingChatMessage[]): string {
+  return entries
+    .map((m) => {
+      const to = m.mentionedNames.length > 0 ? ` → ${m.mentionedNames.join(", ")}` : "";
+      return `- ${m.authorName}${to}: ${m.content}`;
+    })
+    .join("\n");
+}
+
+function collectTelegramMentions(message: TelegramMessage): string[] {
+  const { text, entities } = getMessageTextAndEntities(message);
+  if (!text || !entities || entities.length === 0) return [];
+  const names: string[] = [];
+  for (const entity of entities) {
+    if (entity.type === "mention") {
+      names.push(text.slice(entity.offset, entity.offset + entity.length).replace(/^@/, ""));
+    } else if (entity.type === "text_mention") {
+      const user = (entity as { user?: TelegramUser }).user;
+      if (user) names.push(user.username ?? user.first_name ?? String(user.id));
+    }
+  }
+  return names;
 }
 
 async function downloadImageFromMessage(token: string, message: TelegramMessage): Promise<string | null> {
@@ -665,12 +759,40 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (!isPrivate && !isGroup) return;
 
-  const triggerReason = isGroup ? groupTriggerReason(message) : "private_chat";
-  if (isGroup && !triggerReason) {
-    debugLog(
-      `Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=no_trigger text="${(text ?? "").slice(0, 80)}"`
-    );
-    return;
+  let triggerReason: string | null = isPrivate ? "private_chat" : null;
+  if (isGroup) {
+    const trigger = resolveChatTrigger(chatId);
+    if (!trigger.enabled) {
+      debugLog(`Skip chat=${chatId}: chat disabled by config`);
+      return;
+    }
+    const explicit = isBotExplicitlyMentioned(message);
+    const othersOnly = mentionsOthersOnly(message);
+
+    if (explicit) {
+      triggerReason = explicit;
+    } else if (trigger.ignoreOtherMentions && othersOnly) {
+      const label = message.from?.username ?? message.from?.first_name ?? String(userId ?? "unknown");
+      bufferPendingChatMessage(pendingKey(chatId, threadId), {
+        authorName: label,
+        content: text ?? "",
+        mentionedNames: collectTelegramMentions(message),
+        timestamp: Date.now(),
+      });
+      debugLog(
+        `Buffered mention-to-others chat=${chatId} from=${userId ?? "unknown"} text="${(text ?? "").slice(0, 80)}"`
+      );
+      return;
+    } else if (!trigger.requireMention) {
+      triggerReason = "listen_chat";
+    }
+
+    if (!triggerReason) {
+      debugLog(
+        `Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=no_trigger text="${(text ?? "").slice(0, 80)}"`
+      );
+      return;
+    }
   }
   debugLog(
     `Handle message chat=${chatId} type=${chatType} from=${userId ?? "unknown"} reason=${triggerReason} text="${(text ?? "").slice(0, 80)}"`
@@ -895,8 +1017,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
     }
 
+    const bufferedContext = consumePendingChatMessages(pendingKey(chatId, threadId));
     const promptParts = [`[Telegram from ${label}]`];
     if (threadId) promptParts.push(`[thread:${threadId}]`);
+    if (bufferedContext.length > 0) {
+      promptParts.push(
+        `Recent chat messages not addressed to you (context only, do not reply to them):\n${formatPendingChatContext(bufferedContext)}`,
+      );
+    }
     if (skillContext) {
       // Strip the slash command from the message text and pass remaining args
       const args = text.trim().slice(command!.length).trim();
@@ -947,6 +1075,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         prefixedPrompt,
         (text: string) => {
           streamText = text;
+          // While the stream-so-far still looks like it might be a lone NO_REPLY,
+          // don't post a placeholder — we might end up suppressing the whole reply.
+          if (isSilentReplyPrefixText(text)) return;
           const now = Date.now();
           if (!streamMsgPromise) {
             streamMsgPromise = postStreamMessage(config.token, chatId, text, threadId);
@@ -981,7 +1112,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     if (streamMsgPromise) streamMsgId = await streamMsgPromise;
 
     const responseText = finalResultText ?? streamText;
-    const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(responseText);
+
+    // Agent-initiated silent reply: suppress all output. Clean up any
+    // placeholder the stream may have posted before the NO_REPLY showed up.
+    if (isSilentReplyText(responseText)) {
+      debugLog(`NO_REPLY: suppressing reply to ${label}`);
+      if (streamMsgId) await deleteStreamMessage(config.token, chatId, streamMsgId);
+      return;
+    }
+
+    const strippedResponse = stripSilentToken(responseText);
+    const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(strippedResponse);
     const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
 
     if (reactionEmoji) {
