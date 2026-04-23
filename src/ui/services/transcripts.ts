@@ -1,8 +1,58 @@
 import { homedir } from "node:os";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { peekSession } from "../../sessions";
 import { listThreadSessions } from "../../sessionManager";
+
+// Prefixes of first-user-turn content that indicate a Claude Code internal
+// subagent invocation (not a real conversation). We skip these so the session
+// list doesn't drown in ephemera. Extend as new internal prompts are seen.
+const INTERNAL_SESSION_PROMPT_PREFIXES = [
+  "You classify user messages into thread management intents.",
+];
+
+/** Peek at the first user turn in a jsonl file to decide if it's an internal
+ *  subagent invocation we should hide from the session list. Reads only the
+ *  first 4KB — enough for the opening turn in every observed case. */
+async function isInternalOrphanSession(filePath: string): Promise<boolean> {
+  try {
+    const handle = await open(filePath, "r");
+    try {
+      const buf = Buffer.alloc(4096);
+      const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+      const text = buf.toString("utf-8", 0, bytesRead);
+      // We may have cut a line mid-way; drop the trailing partial line.
+      const lines = text.split("\n");
+      if (bytesRead === buf.length) lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        let obj: unknown;
+        try { obj = JSON.parse(line); } catch { continue; }
+        const o = obj as { type?: string; message?: { content?: unknown } };
+        if (o.type !== "user") continue;
+        const content = o.message?.content;
+        let body = "";
+        if (typeof content === "string") {
+          body = content;
+        } else if (Array.isArray(content)) {
+          for (const part of content) {
+            if (typeof part === "string") { body = part; break; }
+            if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
+              body = (part as { text: string }).text;
+              break;
+            }
+          }
+        }
+        return INTERNAL_SESSION_PROMPT_PREFIXES.some((p) => body.startsWith(p));
+      }
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // fall through — treat as non-internal if we can't read it
+  }
+  return false;
+}
 
 function projectsDir(): string {
   return join(homedir(), ".claude", "projects", process.cwd().replace(/\//g, "-"));
@@ -90,6 +140,10 @@ export async function listSessions(): Promise<SessionSummary[]> {
       existing.fileMtime = mtime;
       existing.hasFile = true;
     } else {
+      // Don't surface Claude Code's internal subagent sessions — they're
+      // noise in the Web UI list. Tracked global/thread sessions are kept
+      // regardless because they're entered explicitly into sessions.json.
+      if (await isInternalOrphanSession(filePath)) continue;
       known.set(sessionId, {
         sessionId,
         kind: "orphan",
