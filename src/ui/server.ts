@@ -6,7 +6,7 @@ import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/setti
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readTranscript } from "./services/transcripts";
-import { sendToTarget } from "../trigger";
+import { sendToTarget, triggerTarget } from "../trigger";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -178,6 +178,30 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           if (!target) return json({ ok: false, error: "target required" }, 400);
           if (!text.trim()) return json({ ok: false, error: "text required" }, 400);
           const result = await sendToTarget(target, text);
+          return json({ ok: true, ...result });
+        } catch (err) {
+          return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 400);
+        }
+      }
+
+      if (url.pathname === "/api/trigger" && req.method === "POST") {
+        try {
+          const body = await req.json() as {
+            target?: unknown;
+            prompt?: unknown;
+            source?: { label?: unknown; sessionId?: unknown };
+          };
+          const target = String(body.target ?? "").trim();
+          const prompt = String(body.prompt ?? "");
+          if (!target) return json({ ok: false, error: "target required" }, 400);
+          if (!prompt.trim()) return json({ ok: false, error: "prompt required" }, 400);
+          const source = body.source
+            ? {
+                label: body.source.label ? String(body.source.label) : undefined,
+                sessionId: body.source.sessionId ? String(body.source.sessionId) : undefined,
+              }
+            : undefined;
+          const result = await triggerTarget(target, prompt, source);
           return json({ ok: true, ...result });
         } catch (err) {
           return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 400);
