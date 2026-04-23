@@ -456,6 +456,20 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
   return { cleanedText, reactionEmoji };
 }
 
+/**
+ * Mid-stream sanitizer. Strips directives and trailing silent-reply marker so
+ * the drain pump never posts meta-text the user shouldn't see, and collapses
+ * whitespace the same way extractReactionDirective does so positions tracked
+ * during drain align with the final cleanedText at end-of-stream.
+ */
+function sanitizeStreamText(text: string): string {
+  return stripSilentToken(text)
+    .replace(/\[react:[^\]\r\n]+\]/gi, "")
+    .replace(/\[send-file:[^\]\r\n]+\]/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
 function extractSendFileDirectives(text: string): {
   cleanedText: string;
   filePaths: string[];
@@ -1061,32 +1075,96 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     const prefixedPrompt = promptParts.join("\n");
 
-    // Streaming reply: defer the initial post until first chunk, then throttle edits.
-    let streamMsgId: number | null = null;
-    let streamMsgPromise: Promise<number | null> | null = null;
-    let streamText = "";
+    // Streaming reply: edit the "live" message while content streams within
+    // a paragraph, but on each "\n\n" boundary, finalize the live message and
+    // start a fresh one for the next paragraph. This way a multi-paragraph
+    // answer surfaces as multiple distinct messages (so the user can tell when
+    // a chunk is finalized / the task is done), while single-paragraph
+    // answers still stream smoothly into one edited message.
+    let streamTextFull = "";
+    let postedLen = 0;                          // bytes of sanitized text already finalized
+    let liveMsgId: number | null = null;        // active paragraph message; null = none yet
+    let liveMsgText = "";                       // last text edited in; skip redundant edits
     let lastStreamUpdate = 0;
+    let postingInFlight: Promise<void> = Promise.resolve();
     let finalResultText: string | null = null;
     let aborted = false;
+
+    const drainStreamBuffer = (): void => {
+      postingInFlight = postingInFlight.then(async () => {
+        const sanitized = sanitizeStreamText(streamTextFull);
+        // If the stream-so-far still looks like it could be a lone NO_REPLY,
+        // hold off — more content might arrive, or we'll suppress entirely.
+        if (isSilentReplyPrefixText(sanitized)) return;
+
+        while (true) {
+          const unposted = sanitized.slice(postedLen);
+          if (!unposted) return;
+
+          const paraBreak = unposted.indexOf("\n\n");
+          const canFinalize = paraBreak !== -1 && paraBreak + 2 <= TELEGRAM_STREAM_MAX_LEN;
+          const forceSplit = unposted.length > TELEGRAM_STREAM_MAX_LEN;
+
+          if (canFinalize || forceSplit) {
+            let cut: number;
+            if (canFinalize) {
+              cut = paraBreak + 2;
+            } else {
+              const slice = unposted.slice(0, TELEGRAM_STREAM_MAX_LEN);
+              const lastNl = slice.lastIndexOf("\n");
+              cut = lastNl >= 100 ? lastNl + 1 : TELEGRAM_STREAM_MAX_LEN;
+            }
+            const chunk = unposted.slice(0, cut).replace(/\s+$/, "");
+            postedLen += cut;
+            if (chunk) {
+              if (liveMsgId !== null) {
+                if (chunk !== liveMsgText) {
+                  await editStreamMessage(config.token, chatId, liveMsgId, chunk);
+                }
+              } else {
+                await postStreamMessage(config.token, chatId, chunk, threadId);
+              }
+            } else if (liveMsgId !== null) {
+              // Paragraph break reached but nothing new in this chunk — orphan placeholder.
+              await deleteStreamMessage(config.token, chatId, liveMsgId);
+            }
+            liveMsgId = null;
+            liveMsgText = "";
+            lastStreamUpdate = 0;
+            continue;
+          }
+
+          // Mid-paragraph: either open the live message or edit it (throttled).
+          const preview = unposted.replace(/\s+$/, "");
+          if (!preview) return;
+
+          const now = Date.now();
+          if (liveMsgId === null) {
+            const id = await postStreamMessage(config.token, chatId, preview, threadId);
+            if (id !== null) {
+              liveMsgId = id;
+              liveMsgText = preview;
+              lastStreamUpdate = now;
+            }
+          } else if (now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS && preview !== liveMsgText) {
+            await editStreamMessage(config.token, chatId, liveMsgId, preview);
+            liveMsgText = preview;
+            lastStreamUpdate = now;
+          }
+          return;
+        }
+      }).catch((err) => {
+        debugLog(`telegram drain error: ${err instanceof Error ? err.message : err}`);
+      });
+    };
 
     try {
       await streamUserMessage(
         "telegram",
         prefixedPrompt,
         (text: string) => {
-          streamText = text;
-          // While the stream-so-far still looks like it might be a lone NO_REPLY,
-          // don't post a placeholder — we might end up suppressing the whole reply.
-          if (isSilentReplyPrefixText(text)) return;
-          const now = Date.now();
-          if (!streamMsgPromise) {
-            streamMsgPromise = postStreamMessage(config.token, chatId, text, threadId);
-            streamMsgPromise.then((id) => { streamMsgId = id; }).catch(() => {});
-            lastStreamUpdate = now;
-          } else if (streamMsgId && now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS) {
-            lastStreamUpdate = now;
-            editStreamMessage(config.token, chatId, streamMsgId, text).catch(() => {});
-          }
+          streamTextFull = text;
+          drainStreamBuffer();
         },
         () => { /* onUnblock — typing interval already shows progress */ },
         undefined,
@@ -1096,33 +1174,33 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       aborted = /abort/i.test(errMsg) || (err instanceof Error && err.name === "AbortError");
-      if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+      await postingInFlight.catch(() => {});
       if (aborted) {
-        // /stop handler already acked — clean up the placeholder silently.
-        if (streamMsgId) await deleteStreamMessage(config.token, chatId, streamMsgId);
+        // /stop handler already acked — clean up the live placeholder silently.
+        if (liveMsgId) await deleteStreamMessage(config.token, chatId, liveMsgId);
         return;
       }
-      if (streamMsgId) {
-        await editStreamMessage(config.token, chatId, streamMsgId, `Error: ${errMsg}`);
+      if (liveMsgId) {
+        await editStreamMessage(config.token, chatId, liveMsgId, `Error: ${errMsg}`);
       } else {
         await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
       }
       return;
     }
 
-    if (streamMsgPromise) streamMsgId = await streamMsgPromise;
+    await postingInFlight.catch(() => {});
 
-    const responseText = finalResultText ?? streamText;
+    const rawResponseText = finalResultText ?? streamTextFull;
 
     // Agent-initiated silent reply: suppress all output. Clean up any
-    // placeholder the stream may have posted before the NO_REPLY showed up.
-    if (isSilentReplyText(responseText)) {
+    // live placeholder the stream may have posted.
+    if (isSilentReplyText(rawResponseText)) {
       debugLog(`NO_REPLY: suppressing reply to ${label}`);
-      if (streamMsgId) await deleteStreamMessage(config.token, chatId, streamMsgId);
+      if (liveMsgId) await deleteStreamMessage(config.token, chatId, liveMsgId);
       return;
     }
 
-    const strippedResponse = stripSilentToken(responseText);
+    const strippedResponse = stripSilentToken(rawResponseText);
     const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(strippedResponse);
     const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
 
@@ -1132,25 +1210,30 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       });
     }
 
-    if (cleanedText) {
-      const firstChunk = cleanedText.slice(0, TELEGRAM_STREAM_MAX_LEN);
-      if (streamMsgId) {
-        await editStreamMessage(config.token, chatId, streamMsgId, firstChunk);
+    // Any content past what's already been finalized in closed messages.
+    // sanitizeStreamText and extractReaction/SendFile use the same newline
+    // normalization, so postedLen aligns with offsets in cleanedText.
+    const tail = cleanedText.slice(postedLen).replace(/^\s+/, "");
+
+    if (tail) {
+      const firstSlice = tail.slice(0, TELEGRAM_STREAM_MAX_LEN);
+      if (liveMsgId !== null) {
+        await editStreamMessage(config.token, chatId, liveMsgId, firstSlice);
       } else {
-        await sendMessage(config.token, chatId, firstChunk, threadId);
+        await sendMessage(config.token, chatId, firstSlice, threadId);
       }
-      if (cleanedText.length > TELEGRAM_STREAM_MAX_LEN) {
-        await sendMessage(config.token, chatId, cleanedText.slice(TELEGRAM_STREAM_MAX_LEN), threadId);
+      for (let i = TELEGRAM_STREAM_MAX_LEN; i < tail.length; i += TELEGRAM_STREAM_MAX_LEN) {
+        await sendMessage(config.token, chatId, tail.slice(i, i + TELEGRAM_STREAM_MAX_LEN), threadId);
       }
-    } else if (filePaths.length === 0) {
-      if (streamMsgId) {
-        await editStreamMessage(config.token, chatId, streamMsgId, "(empty response)");
+    } else if (!cleanedText && filePaths.length === 0) {
+      if (liveMsgId !== null) {
+        await editStreamMessage(config.token, chatId, liveMsgId, "(empty response)");
       } else {
         await sendMessage(config.token, chatId, "(empty response)", threadId);
       }
-    } else if (streamMsgId) {
-      // Directives will handle the output — drop the placeholder.
-      await deleteStreamMessage(config.token, chatId, streamMsgId);
+    } else if (liveMsgId !== null) {
+      // tail is empty but a live placeholder exists — stale, drop it.
+      await deleteStreamMessage(config.token, chatId, liveMsgId);
     }
 
     for (const fp of filePaths) {
