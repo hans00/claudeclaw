@@ -1379,7 +1379,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         );
       }).join("");
       historyTranscript.innerHTML = truncated + turnsHtml;
-      historyTranscript.scrollTop = 0;
+      historyTranscript.scrollTop = historyTranscript.scrollHeight;
     }
 
     function updateHistoryMainHead(session, transcript) {
