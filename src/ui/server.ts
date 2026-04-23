@@ -6,6 +6,7 @@ import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/setti
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readTranscript } from "./services/transcripts";
+import { sendToTarget } from "../trigger";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -166,6 +167,20 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           return json({ ok: true, transcript });
         } catch (err) {
           return json({ ok: false, error: String(err) });
+        }
+      }
+
+      if (url.pathname === "/api/send" && req.method === "POST") {
+        try {
+          const body = await req.json() as { target?: unknown; text?: unknown };
+          const target = String(body.target ?? "").trim();
+          const text = String(body.text ?? "");
+          if (!target) return json({ ok: false, error: "target required" }, 400);
+          if (!text.trim()) return json({ ok: false, error: "text required" }, 400);
+          const result = await sendToTarget(target, text);
+          return json({ ok: true, ...result });
+        } catch (err) {
+          return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 400);
         }
       }
 
