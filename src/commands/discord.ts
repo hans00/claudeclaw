@@ -796,8 +796,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
 
     const prefixedPrompt = promptParts.join("\n");
-    // Use thread-specific session if message is in a known thread
-    const threadId = knownThreads.has(channelId) ? channelId : undefined;
+    // Key every Discord channel (guild channel, thread, or DM) to its own
+    // session so channels don't pollute one another or the global session.
+    // runner's queue/stop/session registry all use this as an opaque key.
+    const threadId = channelId;
 
     // Streaming reply: post each paragraph as a fresh message so nothing ever
     // shows the Discord "(edited)" marker. Chunks are drained on paragraph
