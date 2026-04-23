@@ -470,6 +470,83 @@ function sanitizeStreamText(text: string): string {
     .replace(/\n{3,}/g, "\n\n");
 }
 
+// Earliest "\n\n" paragraph boundary that is NOT inside a fenced code block.
+// Fence opens/closes are only recognized at start-of-line. Returns -1 if none.
+function findSafeParaBreak(text: string): number {
+  let i = 0;
+  let inFence = false;
+  while (i < text.length) {
+    if (text.startsWith("```", i) && (i === 0 || text[i - 1] === "\n")) {
+      inFence = !inFence;
+      i += 3;
+      continue;
+    }
+    if (!inFence && text[i] === "\n" && text[i + 1] === "\n") {
+      return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Walk `text` and report whether it ends inside an unterminated code fence,
+// along with the language tag on the open fence so the split can reopen it.
+function analyzeFenceState(text: string): { inFence: boolean; lang: string } {
+  let i = 0;
+  let inFence = false;
+  let lang = "";
+  while (i < text.length) {
+    if (text.startsWith("```", i) && (i === 0 || text[i - 1] === "\n")) {
+      if (!inFence) {
+        inFence = true;
+        const nl = text.indexOf("\n", i + 3);
+        lang = (nl === -1 ? text.slice(i + 3) : text.slice(i + 3, nl)).trim();
+        i = nl === -1 ? text.length : nl + 1;
+      } else {
+        inFence = false;
+        lang = "";
+        i += 3;
+      }
+      continue;
+    }
+    i++;
+  }
+  return { inFence, lang };
+}
+
+// Fence-aware splitter: slice `text` into pieces each ≤ maxLen, closing any
+// open fence at a cut point and reopening it (same language) at the start of
+// the next piece so code blocks never get visually severed.
+function splitForTelegramStream(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return text ? [text] : [];
+  const pieces: string[] = [];
+  let remaining = text;
+  let carry = "";
+  while (true) {
+    const combined = carry + remaining;
+    if (combined.length <= maxLen) {
+      if (combined) pieces.push(combined);
+      return pieces;
+    }
+    const slice = combined.slice(0, maxLen);
+    const lastNl = slice.lastIndexOf("\n");
+    const cut = lastNl >= 100 ? lastNl + 1 : maxLen;
+    let chunk = combined.slice(0, cut).replace(/\s+$/, "");
+    const consumedFromCarry = Math.min(cut, carry.length);
+    const consumedFromRemaining = cut - consumedFromCarry;
+    const state = analyzeFenceState(chunk);
+    let nextCarry = "";
+    if (state.inFence) {
+      chunk += "\n```";
+      nextCarry = "```" + state.lang + "\n";
+    }
+    if (chunk) pieces.push(chunk);
+    remaining = remaining.slice(consumedFromRemaining);
+    carry = nextCarry;
+    if (!remaining && !carry) return pieces;
+  }
+}
+
 function extractSendFileDirectives(text: string): {
   cleanedText: string;
   filePaths: string[];
@@ -1089,6 +1166,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     let postingInFlight: Promise<void> = Promise.resolve();
     let finalResultText: string | null = null;
     let aborted = false;
+    // Fence re-open text carried over after a forced split inside an open
+    // code block. Prepended (display-only, not counted in postedLen) to the
+    // next chunk so the code block continues cleanly in the following message.
+    let pendingPrefix = "";
 
     const drainStreamBuffer = (): void => {
       postingInFlight = postingInFlight.then(async () => {
@@ -1098,10 +1179,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         if (isSilentReplyPrefixText(sanitized)) return;
 
         while (true) {
-          const unposted = sanitized.slice(postedLen);
+          const raw = sanitized.slice(postedLen);
+          const unposted = pendingPrefix + raw;
           if (!unposted) return;
 
-          const paraBreak = unposted.indexOf("\n\n");
+          const paraBreak = findSafeParaBreak(unposted);
           const canFinalize = paraBreak !== -1 && paraBreak + 2 <= TELEGRAM_STREAM_MAX_LEN;
           const forceSplit = unposted.length > TELEGRAM_STREAM_MAX_LEN;
 
@@ -1114,8 +1196,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
               const lastNl = slice.lastIndexOf("\n");
               cut = lastNl >= 100 ? lastNl + 1 : TELEGRAM_STREAM_MAX_LEN;
             }
-            const chunk = unposted.slice(0, cut).replace(/\s+$/, "");
-            postedLen += cut;
+            let chunk = unposted.slice(0, cut).replace(/\s+$/, "");
+            const consumedFromCarry = Math.min(cut, pendingPrefix.length);
+            const consumedFromRaw = cut - consumedFromCarry;
+            postedLen += consumedFromRaw;
+            pendingPrefix = "";
+
+            // Forced split mid-fence: close the block here and reopen it on
+            // the next chunk so the code stays visually contiguous.
+            if (forceSplit && !canFinalize) {
+              const state = analyzeFenceState(chunk);
+              if (state.inFence) {
+                chunk += "\n```";
+                pendingPrefix = "```" + state.lang + "\n";
+              }
+            }
+
             if (chunk) {
               if (liveMsgId !== null) {
                 if (chunk !== liveMsgText) {
@@ -1138,17 +1234,23 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           const preview = unposted.replace(/\s+$/, "");
           if (!preview) return;
 
+          // If the streamed preview is inside an unterminated fence, append a
+          // synthetic closing ``` so the live edit still renders as a code
+          // block instead of dropping to plain text.
+          const previewState = analyzeFenceState(preview);
+          const displayText = previewState.inFence ? preview + "\n```" : preview;
+
           const now = Date.now();
           if (liveMsgId === null) {
-            const id = await postStreamMessage(config.token, chatId, preview, threadId);
+            const id = await postStreamMessage(config.token, chatId, displayText, threadId);
             if (id !== null) {
               liveMsgId = id;
-              liveMsgText = preview;
+              liveMsgText = displayText;
               lastStreamUpdate = now;
             }
-          } else if (now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS && preview !== liveMsgText) {
-            await editStreamMessage(config.token, chatId, liveMsgId, preview);
-            liveMsgText = preview;
+          } else if (now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS && displayText !== liveMsgText) {
+            await editStreamMessage(config.token, chatId, liveMsgId, displayText);
+            liveMsgText = displayText;
             lastStreamUpdate = now;
           }
           return;
@@ -1212,18 +1314,20 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Any content past what's already been finalized in closed messages.
     // sanitizeStreamText and extractReaction/SendFile use the same newline
-    // normalization, so postedLen aligns with offsets in cleanedText.
-    const tail = cleanedText.slice(postedLen).replace(/^\s+/, "");
+    // normalization, so postedLen aligns with offsets in cleanedText. Splitter
+    // is fence-aware so oversized tails never sever a code block.
+    const tailRaw = (pendingPrefix + cleanedText.slice(postedLen)).replace(/^\s+/, "");
+    pendingPrefix = "";
+    const tailPieces = splitForTelegramStream(tailRaw, TELEGRAM_STREAM_MAX_LEN);
 
-    if (tail) {
-      const firstSlice = tail.slice(0, TELEGRAM_STREAM_MAX_LEN);
+    if (tailPieces.length > 0) {
       if (liveMsgId !== null) {
-        await editStreamMessage(config.token, chatId, liveMsgId, firstSlice);
+        await editStreamMessage(config.token, chatId, liveMsgId, tailPieces[0]);
       } else {
-        await sendMessage(config.token, chatId, firstSlice, threadId);
+        await sendMessage(config.token, chatId, tailPieces[0], threadId);
       }
-      for (let i = TELEGRAM_STREAM_MAX_LEN; i < tail.length; i += TELEGRAM_STREAM_MAX_LEN) {
-        await sendMessage(config.token, chatId, tail.slice(i, i + TELEGRAM_STREAM_MAX_LEN), threadId);
+      for (let i = 1; i < tailPieces.length; i++) {
+        await sendMessage(config.token, chatId, tailPieces[i], threadId);
       }
     } else if (!cleanedText && filePaths.length === 0) {
       if (liveMsgId !== null) {
