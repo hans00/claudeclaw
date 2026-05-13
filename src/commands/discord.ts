@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
-import { getSettings, loadSettings, type DiscordChannelConfig } from "../config";
+import { getSettings, loadSettings, resolveDiscordThinkingMode, type DiscordChannelConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, markThreadInterrupted } from "../sessionManager";
 import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
@@ -196,21 +196,55 @@ function sanitizeStreamText(text: string): string {
 }
 
 /**
- * Post a plain content message. Returns true on success. Used by the streaming
- * paragraph pump — each paragraph is a fresh POST, so no "(edited)" ever shows.
+ * Post a plain content message and return its message ID, or null on failure.
+ * Used as the streaming anchor when thinkingMode === "edit".
  */
-async function postStreamChunkDiscord(
+async function postStreamMessageDiscord(
   token: string,
   channelId: string,
   text: string,
-): Promise<boolean> {
-  if (!text) return false;
+): Promise<string | null> {
+  if (!text) return null;
+  const clipped = text.length > DISCORD_STREAM_MAX_LEN ? text.slice(0, DISCORD_STREAM_MAX_LEN) : text;
   try {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: text });
-    return true;
+    const res = await discordApi<{ id: string }>(
+      token,
+      "POST",
+      `/channels/${channelId}/messages`,
+      { content: clipped },
+    );
+    return res?.id ?? null;
   } catch (err) {
-    debugLog(`postStreamChunk failed: ${err instanceof Error ? err.message : err}`);
-    return false;
+    debugLog(`postStreamMessage failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/** Edit a streaming-anchor message in place (Discord shows an "(edited)" badge). */
+async function editStreamMessageDiscord(
+  token: string,
+  channelId: string,
+  messageId: string,
+  text: string,
+): Promise<void> {
+  const clipped = text.length > DISCORD_STREAM_MAX_LEN ? text.slice(0, DISCORD_STREAM_MAX_LEN) : text;
+  try {
+    await discordApi(token, "PATCH", `/channels/${channelId}/messages/${messageId}`, { content: clipped });
+  } catch (err) {
+    debugLog(`editStreamMessage failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** Delete a streaming-anchor message (used on abort or empty cleanup). */
+async function deleteStreamMessageDiscord(
+  token: string,
+  channelId: string,
+  messageId: string,
+): Promise<void> {
+  try {
+    await discordApi(token, "DELETE", `/channels/${channelId}/messages/${messageId}`);
+  } catch (err) {
+    debugLog(`deleteStreamMessage failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -801,47 +835,92 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     // runner's queue/stop/session registry all use this as an opaque key.
     const threadId = channelId;
 
-    // Streaming reply: post each paragraph as a fresh message so nothing ever
-    // shows the Discord "(edited)" marker. Chunks are drained on paragraph
-    // boundaries or forced splits at DISCORD_STREAM_MAX_LEN.
-    let streamTextFull = "";
-    let postedLen = 0;
+    // Streaming reply. Final answer = ONE message (only split when it exceeds
+    // Discord's 2000-char hard limit). Intermediate "thinking" segments
+    // (assistant text that precedes a tool call) follow thinkingMode:
+    //   - "off"      → never shown; only the final answer is posted
+    //   - "edit"     → live-edit a single rolling message ("(edited)" badge shows)
+    //   - "messages" → no live preview; each segment posted fresh at boundary (default)
+    const thinkingMode = resolveDiscordThinkingMode(channelId);
+
+    let currentSegmentText = "";
+    let liveMsgId: string | null = null;       // only used when thinkingMode === "edit"
+    let liveMsgText = "";
+    let lastStreamUpdate = 0;
     let postingInFlight: Promise<void> = Promise.resolve();
     let finalResultText: string | null = null;
     let aborted = false;
 
-    const drainStreamBuffer = (): void => {
-      postingInFlight = postingInFlight.then(async () => {
-        // If the model's output so far still looks like it could be a silent
-        // NO_REPLY reply, hold off posting — we'll know for sure when either
-        // more content arrives or the stream ends.
-        if (isSilentReplyPrefixText(sanitizeStreamText(streamTextFull))) return;
+    const enqueueDrain = (fn: () => Promise<void>): void => {
+      postingInFlight = postingInFlight.then(fn).catch((err) => {
+        debugLog(`discord drain error: ${err instanceof Error ? err.message : err}`);
+      });
+    };
 
-        while (true) {
-          const sanitized = sanitizeStreamText(streamTextFull);
-          const pending = sanitized.slice(postedLen);
-          if (!pending) return;
+    const onChunkUpdate = (): void => {
+      // Only "edit" mode shows a live preview on Discord. "messages" mode posts
+      // at segment boundaries (no badge); "off" mode posts only the final.
+      if (thinkingMode !== "edit") return;
+      enqueueDrain(async () => {
+        const sanitized = sanitizeStreamText(currentSegmentText);
+        if (isSilentReplyPrefixText(sanitized)) return;
+        const display = sanitized.replace(/\s+$/, "");
+        if (!display) return;
 
-          let cut = -1;
-          const paraBreak = pending.indexOf("\n\n");
-          if (paraBreak !== -1 && paraBreak + 2 <= DISCORD_STREAM_MAX_LEN) {
-            cut = paraBreak + 2;
-          } else if (pending.length > DISCORD_STREAM_MAX_LEN) {
-            const slice = pending.slice(0, DISCORD_STREAM_MAX_LEN);
-            const lastNl = slice.lastIndexOf("\n");
-            cut = lastNl >= 100 ? lastNl + 1 : DISCORD_STREAM_MAX_LEN;
-          } else {
-            return;
+        const now = Date.now();
+        if (liveMsgId === null) {
+          const id = await postStreamMessageDiscord(config.token, channelId, display);
+          if (id !== null) {
+            liveMsgId = id;
+            liveMsgText = display;
+            lastStreamUpdate = now;
           }
+        } else if (now - lastStreamUpdate >= 1500 && display !== liveMsgText) {
+          await editStreamMessageDiscord(config.token, channelId, liveMsgId, display);
+          liveMsgText = display;
+          lastStreamUpdate = now;
+        }
+      });
+    };
 
-          const chunk = pending.slice(0, cut).replace(/\s+$/, "");
-          postedLen += cut;
-          if (chunk) {
-            await postStreamChunkDiscord(config.token, channelId, chunk);
+    const onSegmentEnd = (segmentText: string): void => {
+      enqueueDrain(async () => {
+        const sanitized = sanitizeStreamText(segmentText);
+        if (isSilentReplyPrefixText(sanitized)) {
+          currentSegmentText = "";
+          return;
+        }
+        const trimmed = sanitized.replace(/\s+$/, "");
+
+        if (thinkingMode === "off") {
+          currentSegmentText = "";
+          return;
+        }
+
+        if (thinkingMode === "edit") {
+          // Refresh the rolling live message with the segment's authoritative
+          // text; next segment will overwrite the same message.
+          if (trimmed) {
+            if (liveMsgId === null) {
+              const id = await postStreamMessageDiscord(config.token, channelId, trimmed);
+              if (id !== null) { liveMsgId = id; liveMsgText = trimmed; }
+            } else if (trimmed !== liveMsgText) {
+              await editStreamMessageDiscord(config.token, channelId, liveMsgId, trimmed);
+              liveMsgText = trimmed;
+            }
+          }
+          currentSegmentText = "";
+          return;
+        }
+
+        // thinkingMode === "messages": post each segment as a fresh message,
+        // chunked at the hard 2000-char limit. No live preview, no edits.
+        if (trimmed) {
+          for (let i = 0; i < trimmed.length; i += DISCORD_STREAM_MAX_LEN) {
+            await sendMessage(config.token, channelId, trimmed.slice(i, i + DISCORD_STREAM_MAX_LEN));
           }
         }
-      }).catch((err) => {
-        debugLog(`drainStreamBuffer error: ${err instanceof Error ? err.message : err}`);
+        currentSegmentText = "";
       });
     };
 
@@ -850,32 +929,41 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
         "discord",
         prefixedPrompt,
         (text: string) => {
-          streamTextFull = text;
-          drainStreamBuffer();
+          currentSegmentText = text;
+          onChunkUpdate();
         },
         () => { /* onUnblock */ },
         threadId,
         (text: string) => { finalResultText = text; },
         isGuild ? SILENT_REPLY_PROMPT : undefined,
+        onSegmentEnd,
       );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       aborted = /abort/i.test(errMsg) || (err instanceof Error && err.name === "AbortError");
       await postingInFlight.catch(() => {});
-      if (aborted) return;
-      await sendMessage(config.token, channelId, `Error: ${errMsg}`);
+      if (aborted) {
+        if (liveMsgId) await deleteStreamMessageDiscord(config.token, channelId, liveMsgId);
+        return;
+      }
+      if (liveMsgId) {
+        await editStreamMessageDiscord(config.token, channelId, liveMsgId, `Error: ${errMsg}`);
+      } else {
+        await sendMessage(config.token, channelId, `Error: ${errMsg}`);
+      }
       return;
     }
 
     await postingInFlight.catch(() => {});
 
-    const responseText = finalResultText ?? streamTextFull;
+    const responseText = finalResultText ?? currentSegmentText;
 
     // Agent-initiated silent reply: if the model decided this message shouldn't
     // get a response, suppress it entirely. Reactions still flow through — a
     // lightweight ack is fine even when no reply text is sent.
     if (isSilentReplyText(responseText)) {
       debugLog(`NO_REPLY: suppressing reply to ${label}`);
+      if (liveMsgId) await deleteStreamMessageDiscord(config.token, channelId, liveMsgId);
       return;
     }
 
@@ -888,13 +976,21 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       });
     }
 
+    // Final answer = ONE message. Only split at Discord's 2000-char hard limit.
     const finalText = cleanedText || "(empty response)";
-    const remainder = postedLen === 0
-      ? finalText
-      : finalText.slice(postedLen).replace(/^\s+/, "");
-    if (remainder) {
-      for (let i = 0; i < remainder.length; i += DISCORD_STREAM_MAX_LEN) {
-        await sendMessage(config.token, channelId, remainder.slice(i, i + DISCORD_STREAM_MAX_LEN));
+    if (liveMsgId !== null && finalText.length <= DISCORD_STREAM_MAX_LEN) {
+      // Edit-mode live message can absorb the final text directly.
+      if (finalText !== liveMsgText) {
+        await editStreamMessageDiscord(config.token, channelId, liveMsgId, finalText);
+      }
+    } else {
+      if (liveMsgId !== null) {
+        // Final exceeds one message; the live placeholder no longer makes sense — drop it
+        // so the final goes out as fresh, complete messages.
+        await deleteStreamMessageDiscord(config.token, channelId, liveMsgId);
+      }
+      for (let i = 0; i < finalText.length; i += DISCORD_STREAM_MAX_LEN) {
+        await sendMessage(config.token, channelId, finalText.slice(i, i + DISCORD_STREAM_MAX_LEN));
       }
     }
   } catch (err) {

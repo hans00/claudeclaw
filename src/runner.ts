@@ -653,6 +653,7 @@ async function streamClaude(
   threadId?: string,
   onResult?: (text: string) => void,
   systemAppend?: string,
+  onSegmentEnd?: (text: string) => void,
 ): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -775,20 +776,33 @@ async function streamClaude(
         }
       }
 
-      // Complete assistant message — sync accumulated text as checkpoint
+      // Complete assistant message — sync accumulated text as checkpoint.
+      // If the message also carries tool_use blocks, the text is "intermediate"
+      // (the model is narrating before/around a tool call). Surface it via
+      // onSegmentEnd so the channel can decide whether to keep it as a separate
+      // message, edit it in place, or drop it entirely. Without onSegmentEnd
+      // we fall back to onChunk so legacy callers still see the text.
       if (message.type === "assistant") {
         const msg = (message as any).message;
         if (msg?.content) {
           let fullText = "";
+          let hasToolUse = false;
           for (const block of msg.content) {
             if (block.type === "text" && block.text) {
               fullText += block.text;
+            } else if (block.type === "tool_use") {
+              hasToolUse = true;
             }
           }
           if (fullText) {
-            // Reset accumulator to authoritative text from this turn
-            accumulatedText = fullText;
-            onChunk(accumulatedText);
+            if (hasToolUse && onSegmentEnd) {
+              onSegmentEnd(fullText);
+              // Reset so the next turn's deltas start from a clean slate
+              accumulatedText = "";
+            } else {
+              accumulatedText = fullText;
+              onChunk(accumulatedText);
+            }
             maybeUnblock();
           }
         }
@@ -820,9 +834,10 @@ export async function streamUserMessage(
   threadId?: string,
   onResult?: (text: string) => void,
   systemAppend?: string,
+  onSegmentEnd?: (text: string) => void,
 ): Promise<void> {
   const wrapped = await buildUserPromptPrefix(prompt, threadId);
-  return enqueue(() => streamClaude(name, wrapped, onChunk, onUnblock, threadId, onResult, systemAppend), threadId);
+  return enqueue(() => streamClaude(name, wrapped, onChunk, onUnblock, threadId, onResult, systemAppend, onSegmentEnd), threadId);
 }
 
 const INTERRUPT_NOTE = [

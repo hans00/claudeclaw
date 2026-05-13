@@ -1,6 +1,6 @@
 import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
 import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, resolveSlackThinkingMode } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -1021,7 +1021,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }, 20_000);
 
     // --- Streaming reply (#1) ---
-    // Defer posting until first text chunk arrives, then throttle updates.
+    // Final answer = ONE message. Intermediate "thinking" segments follow thinkingMode:
+    //   - "off"      → no live preview; only the final answer is posted
+    //   - "edit"     → live-edit a single rolling message (Slack edits are silent — default)
+    //   - "messages" → finalize each segment as its own message; next segment fresh
+    const thinkingMode = resolveSlackThinkingMode();
+
     let streamMsgTs: string | null = null;
     let streamMsgPromise: Promise<string | null> | null = null;
     let streamText = "";
@@ -1034,6 +1039,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         prefixedPrompt,
         (text: string) => {
           streamText = text;
+          if (thinkingMode === "off") return;  // suppress live preview entirely
           // Don't post a placeholder while the stream prefix still looks like NO_REPLY.
           if (isSilentReplyPrefixText(text)) return;
           const now = Date.now();
@@ -1052,6 +1058,30 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         sessionThreadId,
         (text: string) => { finalResultText = text; },
         isDirectMessage ? undefined : SILENT_REPLY_PROMPT,
+        (segmentText: string) => {
+          if (thinkingMode === "off") return;
+          if (isSilentReplyPrefixText(segmentText)) return;
+          const trimmed = segmentText.replace(/\s+$/, "");
+          if (!trimmed) return;
+          // "edit": refresh the rolling live message; next segment overwrites it.
+          // "messages": finalize current message and null the ts so next segment posts fresh.
+          (async () => {
+            if (!streamMsgPromise) {
+              streamMsgPromise = postMessage(config.botToken, channelId, trimmed, replyThreadTs);
+              streamMsgTs = await streamMsgPromise;
+            } else {
+              if (!streamMsgTs) streamMsgTs = await streamMsgPromise;
+              if (streamMsgTs) {
+                await updateMessage(config.botToken, channelId, streamMsgTs, trimmed).catch(() => {});
+              }
+            }
+            if (thinkingMode === "messages") {
+              streamMsgTs = null;
+              streamMsgPromise = null;
+              lastStreamUpdate = 0;
+            }
+          })().catch(() => {});
+        },
       );
     } catch (err) {
       clearInterval(statusRefreshInterval);
@@ -1319,6 +1349,7 @@ async function handleBlockAction(payload: any): Promise<void> {
   const prompt = `[Slack interactive from ${user.id}]\nUser clicked: "${label}" (action: ${actionId}, value: ${value})`;
 
   // --- Streaming reply for interactive actions (deferred post) ---
+  const thinkingMode = resolveSlackThinkingMode();
   let streamMsgTs: string | null = null;
   let streamMsgPromise: Promise<string | null> | null = null;
   let streamText = "";
@@ -1331,6 +1362,7 @@ async function handleBlockAction(payload: any): Promise<void> {
       prompt,
       (text: string) => {
         streamText = text;
+        if (thinkingMode === "off") return;
         const now = Date.now();
         if (!streamMsgPromise) {
           streamMsgPromise = postMessage(config.botToken, channelId, streamText, replyThreadTs);
@@ -1344,6 +1376,28 @@ async function handleBlockAction(payload: any): Promise<void> {
       () => {},
       sessionThreadId,
       (text: string) => { finalResultText = text; },
+      undefined,
+      (segmentText: string) => {
+        if (thinkingMode === "off") return;
+        const trimmed = segmentText.replace(/\s+$/, "");
+        if (!trimmed) return;
+        (async () => {
+          if (!streamMsgPromise) {
+            streamMsgPromise = postMessage(config.botToken, channelId, trimmed, replyThreadTs);
+            streamMsgTs = await streamMsgPromise;
+          } else {
+            if (!streamMsgTs) streamMsgTs = await streamMsgPromise;
+            if (streamMsgTs) {
+              await updateMessage(config.botToken, channelId, streamMsgTs, trimmed).catch(() => {});
+            }
+          }
+          if (thinkingMode === "messages") {
+            streamMsgTs = null;
+            streamMsgPromise = null;
+            lastStreamUpdate = 0;
+          }
+        })().catch(() => {});
+      },
     );
   } catch (err) {
     if (statusRefreshInterval) clearInterval(statusRefreshInterval);

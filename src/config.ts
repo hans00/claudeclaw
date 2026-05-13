@@ -94,6 +94,10 @@ export interface HeartbeatConfig {
   forwardToTelegram: boolean;
 }
 
+/** How to surface intermediate "thinking" text (assistant messages that
+ *  precede tool calls) in chat platforms. */
+export type ThinkingMode = "off" | "edit" | "messages";
+
 /** Per-chat trigger overrides for Telegram groups/supergroups.
  *  Keyed by chat ID (as a string) in TelegramConfig.chats. */
 export interface TelegramChatConfig {
@@ -105,6 +109,8 @@ export interface TelegramChatConfig {
   /** When true, a message that @-mentions another user (and not the bot) is
    *  treated as not-for-the-bot and buffered as ambient context. Default: true. */
   ignoreOtherMentions?: boolean;
+  /** How to render intermediate thinking text. Default: "messages". */
+  thinkingMode?: ThinkingMode;
 }
 
 export interface TelegramConfig {
@@ -112,6 +118,8 @@ export interface TelegramConfig {
   allowedUserIds: number[];
   /** Per-chat config overrides keyed by chat ID. */
   chats: Record<string, TelegramChatConfig>;
+  /** Default thinkingMode for chats without an override. Default: "messages". */
+  thinkingMode?: ThinkingMode;
 }
 
 /** Per-channel trigger overrides for Discord guild channels and threads.
@@ -125,6 +133,8 @@ export interface DiscordChannelConfig {
   /** When true, a message that mentions another user (and not the bot) is
    *  treated as not-for-the-bot and buffered as ambient context. Default: true. */
   ignoreOtherMentions?: boolean;
+  /** How to render intermediate thinking text. Default: "messages". */
+  thinkingMode?: ThinkingMode;
 }
 
 export interface DiscordConfig {
@@ -136,6 +146,8 @@ export interface DiscordConfig {
   allowedBotIds: string[]; // Bot IDs allowed to trigger (mention only, not listen_channel)
   /** Per-channel config overrides keyed by channel or thread ID. */
   channels: Record<string, DiscordChannelConfig>;
+  /** Default thinkingMode for channels without an override. Default: "messages". */
+  thinkingMode?: ThinkingMode;
 }
 
 export interface SlackConfig {
@@ -148,6 +160,8 @@ export interface SlackConfig {
   allowedUserIds: string[];
   /** Channel IDs where the bot responds to every message without needing a mention */
   listenChannels: string[];
+  /** How to render intermediate thinking text. Default: "edit". */
+  thinkingMode?: ThinkingMode;
 }
 
 /** Per-group configuration overrides for LINE groups/rooms.
@@ -353,6 +367,7 @@ function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = [
       token: raw.telegram?.token ?? "",
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
       chats: parseTelegramChats(raw.telegram?.chats),
+      thinkingMode: parseThinkingMode(raw.telegram?.thinkingMode),
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
@@ -368,6 +383,7 @@ function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = [
         ? raw.discord.allowedBotIds.map(String)
         : [],
       channels: parseDiscordChannels(raw.discord?.channels),
+      thinkingMode: parseThinkingMode(raw.discord?.thinkingMode),
     },
     slack: {
       botToken: typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : "",
@@ -378,6 +394,7 @@ function parseSettings(raw: Record<string, any>, rawDiscordUserIds: string[] = [
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
+      thinkingMode: parseThinkingMode(raw.slack?.thinkingMode),
     },
     line: {
       channelAccessToken: typeof raw.line?.channelAccessToken === "string" ? raw.line.channelAccessToken.trim() : "",
@@ -474,6 +491,11 @@ function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): 
   return resolveTimezoneOffsetMinutes(value, timezoneFallback);
 }
 
+function parseThinkingMode(value: unknown): ThinkingMode | undefined {
+  if (value === "off" || value === "edit" || value === "messages") return value;
+  return undefined;
+}
+
 function parseDiscordChannels(raw: unknown): Record<string, DiscordChannelConfig> {
   const out: Record<string, DiscordChannelConfig> = {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -484,6 +506,8 @@ function parseDiscordChannels(raw: unknown): Record<string, DiscordChannelConfig
     if (typeof cfg.enabled === "boolean") entry.enabled = cfg.enabled;
     if (typeof cfg.requireMention === "boolean") entry.requireMention = cfg.requireMention;
     if (typeof cfg.ignoreOtherMentions === "boolean") entry.ignoreOtherMentions = cfg.ignoreOtherMentions;
+    const tm = parseThinkingMode(cfg.thinkingMode);
+    if (tm) entry.thinkingMode = tm;
     out[String(channelId)] = entry;
   }
   return out;
@@ -499,9 +523,37 @@ function parseTelegramChats(raw: unknown): Record<string, TelegramChatConfig> {
     if (typeof cfg.enabled === "boolean") entry.enabled = cfg.enabled;
     if (typeof cfg.requireMention === "boolean") entry.requireMention = cfg.requireMention;
     if (typeof cfg.ignoreOtherMentions === "boolean") entry.ignoreOtherMentions = cfg.ignoreOtherMentions;
+    const tm = parseThinkingMode(cfg.thinkingMode);
+    if (tm) entry.thinkingMode = tm;
     out[String(chatId)] = entry;
   }
   return out;
+}
+
+/** Defaults per platform — picked for the platform's UX norms. */
+const DEFAULT_THINKING_MODE: { telegram: ThinkingMode; discord: ThinkingMode; slack: ThinkingMode } = {
+  telegram: "messages",
+  discord: "messages",
+  slack: "edit",
+};
+
+/** Resolve effective thinkingMode for a Telegram chat. Per-chat override → global override → platform default. */
+export function resolveTelegramThinkingMode(chatId: string | number): ThinkingMode {
+  const settings = getSettings();
+  const chatCfg = settings.telegram.chats[String(chatId)];
+  return chatCfg?.thinkingMode ?? settings.telegram.thinkingMode ?? DEFAULT_THINKING_MODE.telegram;
+}
+
+/** Resolve effective thinkingMode for a Discord channel/thread. */
+export function resolveDiscordThinkingMode(channelId: string): ThinkingMode {
+  const settings = getSettings();
+  const channelCfg = settings.discord.channels[channelId];
+  return channelCfg?.thinkingMode ?? settings.discord.thinkingMode ?? DEFAULT_THINKING_MODE.discord;
+}
+
+/** Resolve effective thinkingMode for Slack. */
+export function resolveSlackThinkingMode(): ThinkingMode {
+  return getSettings().slack.thinkingMode ?? DEFAULT_THINKING_MODE.slack;
 }
 
 /**

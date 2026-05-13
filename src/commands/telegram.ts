@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, run, runUserMessage, streamUserMessage, compactCurrentSession, stopCurrentRun } from "../runner";
-import { getSettings, loadSettings, type TelegramChatConfig } from "../config";
+import { getSettings, loadSettings, resolveTelegramThinkingMode, type TelegramChatConfig } from "../config";
 import { resetSession, peekSession, markSessionInterrupted } from "../sessions";
 import { isSilentReplyText, isSilentReplyPrefixText, stripSilentToken, SILENT_REPLY_PROMPT } from "../silent";
 import { readFile } from "node:fs/promises";
@@ -468,25 +468,6 @@ function sanitizeStreamText(text: string): string {
     .replace(/\[send-file:[^\]\r\n]+\]/gi, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n");
-}
-
-// Earliest "\n\n" paragraph boundary that is NOT inside a fenced code block.
-// Fence opens/closes are only recognized at start-of-line. Returns -1 if none.
-function findSafeParaBreak(text: string): number {
-  let i = 0;
-  let inFence = false;
-  while (i < text.length) {
-    if (text.startsWith("```", i) && (i === 0 || text[i - 1] === "\n")) {
-      inFence = !inFence;
-      i += 3;
-      continue;
-    }
-    if (!inFence && text[i] === "\n" && text[i + 1] === "\n") {
-      return i;
-    }
-    i++;
-  }
-  return -1;
 }
 
 // Walk `text` and report whether it ends inside an unterminated code fence,
@@ -1152,111 +1133,110 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     const prefixedPrompt = promptParts.join("\n");
 
-    // Streaming reply: edit the "live" message while content streams within
-    // a paragraph, but on each "\n\n" boundary, finalize the live message and
-    // start a fresh one for the next paragraph. This way a multi-paragraph
-    // answer surfaces as multiple distinct messages (so the user can tell when
-    // a chunk is finalized / the task is done), while single-paragraph
-    // answers still stream smoothly into one edited message.
-    let streamTextFull = "";
-    let postedLen = 0;                          // bytes of sanitized text already finalized
-    let liveMsgId: number | null = null;        // active paragraph message; null = none yet
-    let liveMsgText = "";                       // last text edited in; skip redundant edits
+    // Streaming reply. Final answer = ONE message (only fence-aware split when
+    // it exceeds the Telegram length limit). Intermediate "thinking" segments
+    // (assistant text that precedes a tool call) are surfaced per thinkingMode:
+    //   - "off"      → never shown; only the final answer is posted
+    //   - "edit"     → edited into a single rolling message; replaced each turn
+    //   - "messages" → each segment posted as a fresh message (default for TG)
+    const thinkingMode = resolveTelegramThinkingMode(chatId);
+
+    let currentSegmentText = "";                // current segment's accumulated text
+    let liveMsgId: number | null = null;        // live message for current segment
+    let liveMsgText = "";                       // last text edited into liveMsgId
     let lastStreamUpdate = 0;
     let postingInFlight: Promise<void> = Promise.resolve();
     let finalResultText: string | null = null;
     let aborted = false;
-    // Fence re-open text carried over after a forced split inside an open
-    // code block. Prepended (display-only, not counted in postedLen) to the
-    // next chunk so the code block continues cleanly in the following message.
-    let pendingPrefix = "";
 
-    const drainStreamBuffer = (): void => {
-      postingInFlight = postingInFlight.then(async () => {
-        const sanitized = sanitizeStreamText(streamTextFull);
-        // If the stream-so-far still looks like it could be a lone NO_REPLY,
-        // hold off — more content might arrive, or we'll suppress entirely.
+    const enqueueDrain = (fn: () => Promise<void>): void => {
+      postingInFlight = postingInFlight.then(fn).catch((err) => {
+        debugLog(`telegram drain error: ${err instanceof Error ? err.message : err}`);
+      });
+    };
+
+    // Render a possibly-mid-fence preview safely: synthesize a closing ```
+    // when the text ends inside an open fence so the live edit still renders
+    // as a code block instead of dropping to plain text.
+    const previewDisplay = (text: string): string => {
+      const trimmed = text.replace(/\s+$/, "");
+      if (!trimmed) return "";
+      const state = analyzeFenceState(trimmed);
+      return state.inFence ? trimmed + "\n```" : trimmed;
+    };
+
+    const onChunkUpdate = (): void => {
+      if (thinkingMode === "off") return;  // suppress live preview entirely
+      enqueueDrain(async () => {
+        const sanitized = sanitizeStreamText(currentSegmentText);
         if (isSilentReplyPrefixText(sanitized)) return;
+        const display = previewDisplay(sanitized);
+        if (!display) return;
 
-        while (true) {
-          const raw = sanitized.slice(postedLen);
-          const unposted = pendingPrefix + raw;
-          if (!unposted) return;
-
-          const paraBreak = findSafeParaBreak(unposted);
-          const canFinalize = paraBreak !== -1 && paraBreak + 2 <= TELEGRAM_STREAM_MAX_LEN;
-          const forceSplit = unposted.length > TELEGRAM_STREAM_MAX_LEN;
-
-          if (canFinalize || forceSplit) {
-            let cut: number;
-            if (canFinalize) {
-              cut = paraBreak + 2;
-            } else {
-              const slice = unposted.slice(0, TELEGRAM_STREAM_MAX_LEN);
-              const lastNl = slice.lastIndexOf("\n");
-              cut = lastNl >= 100 ? lastNl + 1 : TELEGRAM_STREAM_MAX_LEN;
-            }
-            let chunk = unposted.slice(0, cut).replace(/\s+$/, "");
-            const consumedFromCarry = Math.min(cut, pendingPrefix.length);
-            const consumedFromRaw = cut - consumedFromCarry;
-            postedLen += consumedFromRaw;
-            pendingPrefix = "";
-
-            // Forced split mid-fence: close the block here and reopen it on
-            // the next chunk so the code stays visually contiguous.
-            if (forceSplit && !canFinalize) {
-              const state = analyzeFenceState(chunk);
-              if (state.inFence) {
-                chunk += "\n```";
-                pendingPrefix = "```" + state.lang + "\n";
-              }
-            }
-
-            if (chunk) {
-              if (liveMsgId !== null) {
-                if (chunk !== liveMsgText) {
-                  await editStreamMessage(config.token, chatId, liveMsgId, chunk);
-                }
-              } else {
-                await postStreamMessage(config.token, chatId, chunk, threadId);
-              }
-            } else if (liveMsgId !== null) {
-              // Paragraph break reached but nothing new in this chunk — orphan placeholder.
-              await deleteStreamMessage(config.token, chatId, liveMsgId);
-            }
-            liveMsgId = null;
-            liveMsgText = "";
-            lastStreamUpdate = 0;
-            continue;
-          }
-
-          // Mid-paragraph: either open the live message or edit it (throttled).
-          const preview = unposted.replace(/\s+$/, "");
-          if (!preview) return;
-
-          // If the streamed preview is inside an unterminated fence, append a
-          // synthetic closing ``` so the live edit still renders as a code
-          // block instead of dropping to plain text.
-          const previewState = analyzeFenceState(preview);
-          const displayText = previewState.inFence ? preview + "\n```" : preview;
-
-          const now = Date.now();
-          if (liveMsgId === null) {
-            const id = await postStreamMessage(config.token, chatId, displayText, threadId);
-            if (id !== null) {
-              liveMsgId = id;
-              liveMsgText = displayText;
-              lastStreamUpdate = now;
-            }
-          } else if (now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS && displayText !== liveMsgText) {
-            await editStreamMessage(config.token, chatId, liveMsgId, displayText);
-            liveMsgText = displayText;
+        const now = Date.now();
+        if (liveMsgId === null) {
+          const id = await postStreamMessage(config.token, chatId, display, threadId);
+          if (id !== null) {
+            liveMsgId = id;
+            liveMsgText = display;
             lastStreamUpdate = now;
           }
+        } else if (now - lastStreamUpdate >= TELEGRAM_STREAM_UPDATE_INTERVAL_MS && display !== liveMsgText) {
+          await editStreamMessage(config.token, chatId, liveMsgId, display);
+          liveMsgText = display;
+          lastStreamUpdate = now;
+        }
+      });
+    };
+
+    // A segment (intermediate assistant text before a tool call) just finalized.
+    const onSegmentEnd = (segmentText: string): void => {
+      enqueueDrain(async () => {
+        const sanitized = sanitizeStreamText(segmentText);
+        // Skip NO_REPLY-prefix segments outright.
+        if (isSilentReplyPrefixText(sanitized)) {
+          currentSegmentText = "";
           return;
         }
-      }).catch((err) => {
-        debugLog(`telegram drain error: ${err instanceof Error ? err.message : err}`);
+        const display = previewDisplay(sanitized);
+
+        if (thinkingMode === "off") {
+          currentSegmentText = "";
+          return;
+        }
+
+        if (thinkingMode === "edit") {
+          // Refresh the rolling live message with this segment's authoritative
+          // text; next segment will overwrite the same message.
+          if (display) {
+            if (liveMsgId === null) {
+              const id = await postStreamMessage(config.token, chatId, display, threadId);
+              if (id !== null) { liveMsgId = id; liveMsgText = display; }
+            } else if (display !== liveMsgText) {
+              await editStreamMessage(config.token, chatId, liveMsgId, display);
+              liveMsgText = display;
+            }
+          }
+          currentSegmentText = "";
+          return;
+        }
+
+        // thinkingMode === "messages": freeze current live message, post next segment fresh.
+        if (!display) {
+          // Empty segment — clean up any orphan placeholder from live preview.
+          if (liveMsgId !== null) {
+            await deleteStreamMessage(config.token, chatId, liveMsgId);
+          }
+        } else if (liveMsgId === null) {
+          await postStreamMessage(config.token, chatId, display, threadId);
+        } else if (display !== liveMsgText) {
+          // Sync the throttled live preview to the segment's final text.
+          await editStreamMessage(config.token, chatId, liveMsgId, display);
+        }
+        liveMsgId = null;
+        liveMsgText = "";
+        lastStreamUpdate = 0;
+        currentSegmentText = "";
       });
     };
 
@@ -1265,13 +1245,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "telegram",
         prefixedPrompt,
         (text: string) => {
-          streamTextFull = text;
-          drainStreamBuffer();
+          currentSegmentText = text;
+          onChunkUpdate();
         },
         () => { /* onUnblock — typing interval already shows progress */ },
         undefined,
         (text: string) => { finalResultText = text; },
         isGroup ? SILENT_REPLY_PROMPT : undefined,
+        onSegmentEnd,
       );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -1292,7 +1273,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     await postingInFlight.catch(() => {});
 
-    const rawResponseText = finalResultText ?? streamTextFull;
+    const rawResponseText = finalResultText ?? currentSegmentText;
 
     // Agent-initiated silent reply: suppress all output. Clean up any
     // live placeholder the stream may have posted.
@@ -1312,22 +1293,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       });
     }
 
-    // Any content past what's already been finalized in closed messages.
-    // sanitizeStreamText and extractReaction/SendFile use the same newline
-    // normalization, so postedLen aligns with offsets in cleanedText. Splitter
-    // is fence-aware so oversized tails never sever a code block.
-    const tailRaw = (pendingPrefix + cleanedText.slice(postedLen)).replace(/^\s+/, "");
-    pendingPrefix = "";
-    const tailPieces = splitForTelegramStream(tailRaw, TELEGRAM_STREAM_MAX_LEN);
+    // Final answer goes out as ONE message. Only when it exceeds the
+    // per-message limit do we split — and even then, fence-aware so code
+    // blocks stay visually intact across pieces.
+    const finalPieces = splitForTelegramStream(cleanedText, TELEGRAM_STREAM_MAX_LEN);
 
-    if (tailPieces.length > 0) {
+    if (finalPieces.length > 0) {
       if (liveMsgId !== null) {
-        await editStreamMessage(config.token, chatId, liveMsgId, tailPieces[0]);
+        await editStreamMessage(config.token, chatId, liveMsgId, finalPieces[0]);
       } else {
-        await sendMessage(config.token, chatId, tailPieces[0], threadId);
+        await sendMessage(config.token, chatId, finalPieces[0], threadId);
       }
-      for (let i = 1; i < tailPieces.length; i++) {
-        await sendMessage(config.token, chatId, tailPieces[i], threadId);
+      for (let i = 1; i < finalPieces.length; i++) {
+        await sendMessage(config.token, chatId, finalPieces[i], threadId);
       }
     } else if (!cleanedText && filePaths.length === 0) {
       if (liveMsgId !== null) {
