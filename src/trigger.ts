@@ -13,6 +13,7 @@ import { loadSettings } from "./config";
 import { runUserMessage } from "./runner";
 import { sendMessage as sendTelegramMessage } from "./commands/telegram";
 import { sendMessage as sendDiscordMessage } from "./commands/discord";
+import { appendInbox, inboxKeyForTarget } from "./inbox";
 
 export interface SendResult {
   target: string;
@@ -48,16 +49,41 @@ export async function sendToTarget(target: string, text: string): Promise<SendRe
     if (!Number.isFinite(chatId)) throw new Error(`invalid telegram chatId "${id}"`);
     if (!settings.telegram.token) throw new Error("telegram not configured");
     await sendTelegramMessage(settings.telegram.token, chatId, text);
+    await recordInboxForSend(kind, id, text, target);
     return { target, kind };
   }
 
   if (kind === "discord") {
     if (!settings.discord.token) throw new Error("discord not configured");
     await sendDiscordMessage(settings.discord.token, id, text);
+    await recordInboxForSend(kind, id, text, target);
     return { target, kind };
   }
 
   throw new Error(`unknown target kind "${kind}" (expected telegram|discord)`);
+}
+
+async function recordInboxForSend(
+  kind: string,
+  id: string,
+  text: string,
+  target: string,
+): Promise<void> {
+  const key = inboxKeyForTarget(kind, id);
+  if (!key) return;
+  try {
+    await appendInbox(key, {
+      kind: "send",
+      from: "(bridge)",
+      text,
+      note: `target=${target}`,
+    });
+  } catch (err) {
+    console.error(
+      `[inbox] append failed for ${target}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
 }
 
 export async function triggerTarget(

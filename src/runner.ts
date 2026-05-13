@@ -18,6 +18,7 @@ import {
 import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { drainInbox, formatInboxForPrompt, inboxKeyForThread } from "./inbox";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -865,6 +866,19 @@ async function buildUserPromptPrefix(prompt: string, threadId?: string): Promise
     parts.push(buildClockPromptPrefix(new Date(), settings.timezoneOffsetMinutes));
   } catch {
     parts.push(buildClockPromptPrefix(new Date(), 0));
+  }
+
+  // Inbox: drain cross-session events that arrived while this thread was idle
+  // and inject them as a system-note block so the resumed session has context.
+  try {
+    const entries = await drainInbox(inboxKeyForThread(threadId));
+    const formatted = formatInboxForPrompt(entries);
+    if (formatted) parts.push(formatted);
+  } catch (err) {
+    console.error(
+      `[inbox] drain failed for thread=${threadId ?? "global"}:`,
+      err instanceof Error ? err.message : err,
+    );
   }
 
   parts.push(prompt);
